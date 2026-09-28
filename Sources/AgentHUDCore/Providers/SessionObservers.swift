@@ -15,7 +15,16 @@ public enum SessionObservers {
             catch { NSLog("[AgentHUD] Notification hook setup failed for %@: %@", source.rawValue, error.localizedDescription) }
         }
         for source in PermissionHooks.Source.allCases where source.isInstalled(home: home) {
-            do { try PermissionHooks.configure(source, enabled: enabled, executable: executable, home: home) }
+            do {
+                // OpenCode carries no hooks block; its permission surface is a plugin file under plugins/, written and
+                // removed by OpenCodeHookInstaller instead of edited into a settings file.
+                if source == .opencode {
+                    if enabled { try OpenCodeHookInstaller.install(executable: executable, home: home) }
+                    else { OpenCodeHookInstaller.uninstall(home: home) }
+                } else {
+                    try PermissionHooks.configure(source, enabled: enabled, executable: executable, home: home)
+                }
+            }
             catch { NSLog("[AgentHUD] Permission hook setup failed for %@: %@", source.rawValue, error.localizedDescription) }
         }
         for source in CompletionHooks.Source.allCases {
