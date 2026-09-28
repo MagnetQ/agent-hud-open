@@ -1,9 +1,18 @@
 import SwiftUI
 import AgentHUDCore
 
+// Local build shim: a Command Line Tools–only toolchain ships no SwiftUIMacros plugin, so `@Entry`
+// cannot expand here. This is the expansion the macro produces.
+private struct GlowFrozenTimeKey: EnvironmentKey {
+    static let defaultValue: Double? = nil
+}
+
 extension EnvironmentValues {
     /// Draws one fixed moment of the grid glow effects instead of animating them (snapshots).
-    @Entry var glowFrozenTime: Double? = nil
+    var glowFrozenTime: Double? {
+        get { self[GlowFrozenTimeKey.self] }
+        set { self[GlowFrozenTimeKey.self] = newValue }
+    }
 }
 
 /// Uses the desktop glow renderer for settings previews, onboarding and snapshots.

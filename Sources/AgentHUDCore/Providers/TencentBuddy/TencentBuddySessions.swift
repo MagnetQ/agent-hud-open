@@ -147,7 +147,9 @@ enum CodeBuddySessions: LocalSessionLayout {
 
 enum WorkBuddySessions: LocalSessionLayout {
     static let installPaths = [".workbuddy/projects"]
-    static func roots(home: URL, environment: [String: String]) -> [URL] { [home.appendingPathComponent(".workbuddy/projects")] }
+    /// CodeBuddy Code's engine keeps WorkBuddy's configuration and data folder in `~/.workbuddy`.
+    static func home(_ home: URL) -> URL { home.appendingPathComponent(".workbuddy") }
+    static func roots(home: URL, environment: [String: String]) -> [URL] { [self.home(home).appendingPathComponent("projects")] }
     static func accepts(_ url: URL) -> Bool { url.pathExtension == "jsonl" }
     static func skips(_ url: URL) -> Bool { url.lastPathComponent == "tool-results" }
     static func read(_ url: URL) throws -> ProviderSessions { try TencentBuddySessions.read(url, source: .workbuddy) }

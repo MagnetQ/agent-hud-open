@@ -4,7 +4,7 @@ import Foundation
 /// line as JSON it extracts only the fields the accumulator needs with `memchr`/`memmem` searches. The small
 /// `usage` object is the only piece handed to `JSONSerialization`.
 ///
-/// Claude Code puts `message.role`/`message.id`/`model` at the start of a line and `stop_reason`, `usage`,
+/// Claude Code puts `message.role`/`message.id` at the start of a line and `model`, `stop_reason`, `usage`,
 /// `requestId`, `timestamp` at the end, with the (possibly huge) message content in between. Early keys are
 /// searched in a bounded prefix and late keys backwards, so a 500 KB tool result costs almost nothing.
 /// Current builds write `type`, `cwd` and `sessionId` after the message; older builds wrote them first.
@@ -14,6 +14,9 @@ public enum FastTranscriptParser {
     static let messageLength = 2048
     /// Current builds write `entrypoint`, `cwd`, `sessionId` and `version` after the message, close to the end.
     private static let tailLength = 2048
+    /// How far before the usage object `model` can sit. Current builds write the message content first, so a long
+    /// message pushes `model` (and `stop_reason`) far past `prefixLength`.
+    private static let modelWindowLength = 1024
 
     private static let timestampKey = Array("\"timestamp\":\"".utf8)
     private static let assistantRoleMarker = Array("\"role\":\"assistant\"".utf8)
@@ -125,7 +128,7 @@ public enum FastTranscriptParser {
                 output = count(usage["output_tokens"])
                 thinking = count((usage["output_tokens_details"] as? [String: Any])?["thinking_tokens"])
             }
-            model = value(after: modelKey, in: head)
+            model = modelBeforeUsage(in: line) ?? value(after: modelKey, in: head)
             messageId = value(after: messageIdKey, in: head) ?? value(after: fallbackIdKey, in: head).map { "msg_" + $0 }
             requestId = value(after: requestIdKey, in: line, backwards: true)
             // The message-level reason follows the content, so the last occurrence is the real one.
@@ -251,6 +254,18 @@ public enum FastTranscriptParser {
         wrapped.append(contentsOf: raw)
         wrapped.append(Data("\"]".utf8))
         return (try? JSONSerialization.jsonObject(with: wrapped) as? [String])?.first
+    }
+
+    /// The message's `model`, read from the window that precedes the usage object. Current builds write the content
+    /// before it, so a long message puts `model` past `prefixLength`; the window is bounded so a `model` quoted
+    /// inside the content can never win, and the last key in it is the message's own because `stop_reason` and
+    /// `usage` follow immediately. Older builds, which wrote `model` before the content, fall back to `head`.
+    private static func modelBeforeUsage(in line: UnsafeRawBufferPointer) -> String? {
+        guard let usage = find(usageKey, in: line, backwards: true) else { return nil }
+        let start = max(0, usage - modelWindowLength)
+        guard let offset = find(modelKey, in: UnsafeRawBufferPointer(rebasing: line[start..<usage]), backwards: true)
+        else { return nil }
+        return string(from: start + offset + modelKey.count, in: line)
     }
 
     /// The `usage` object as a dictionary (brace-matched slice fed to JSONSerialization). The real usage object is

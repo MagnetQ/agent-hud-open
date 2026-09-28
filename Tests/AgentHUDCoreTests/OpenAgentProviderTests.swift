@@ -1,4 +1,3 @@
-import AgentHUDSupport
 import XCTest
 import SQLite3
 @testable import AgentHUDCore
@@ -112,10 +111,10 @@ final class OpenAgentProviderTests: XCTestCase {
         XCTAssertThrowsError(try OpenAgentQuotaClient.parse(json(#"{"success":false,"code":200,"data":{"limits":[]}}"#), credential: credential(.glmChina), now: now))
     }
 
-    func piLines(session: String = "original", entry: String = "message-a", provider: String = "openai-codex", model: String = "model-x") -> String {
+    func piLines(session: String = "original", entry: String = "message-a", provider: String = "openai-codex") -> String {
         """
         {"type":"session","id":"\(session)","cwd":"/workspace","timestamp":"2026-09-07T00:00:00Z"}
-        {"type":"message","id":"\(entry)","timestamp":"2026-09-07T00:00:01Z","message":{"role":"assistant","provider":"\(provider)","model":"\(model)","stopReason":"stop","usage":{"input":10,"output":20,"reasoning":5,"cacheRead":30,"cacheWrite":4,"cost":{"total":0.01}}}}
+        {"type":"message","id":"\(entry)","timestamp":"2026-09-07T00:00:01Z","message":{"role":"assistant","provider":"\(provider)","model":"model-x","stopReason":"stop","usage":{"input":10,"output":20,"reasoning":5,"cacheRead":30,"cacheWrite":4,"cost":{"total":0.01}}}}
         """
     }
     func testPiForksDeduplicateButDifferentRequestsAndProviderRoutesRemainDistinct() throws {
@@ -129,51 +128,10 @@ final class OpenAgentProviderTests: XCTestCase {
         XCTAssertEqual(a.events[0].tokensIn, 14)
         XCTAssertEqual(a.events[0].tokensOut, 20) // reasoning is already within Pi output.
         XCTAssertEqual(a.events[0].cacheReadTokens, 30)
+        XCTAssertEqual(a.events[0].attribution?.estimatedUSD, Decimal(string: "0.01"))
         XCTAssertNil(a.events[0].attribution?.pool)
         XCTAssertTrue(a.completions.isEmpty)
         XCTAssertTrue(a.turns.isEmpty)
-    }
-
-    func testCallsArePricedByTheModelTheyNamedThroughTheVendorsOwnService() async throws {
-        let luna = try XCTUnwrap(OpenAgentParser.pi(Data(piLines(model: "gpt-5.6-luna").utf8), path: "/a.jsonl").first)
-        let route = try XCTUnwrap(OpenAgentParser.pi(Data(piLines(provider: "openai", model: "gpt-5.6-luna").utf8), path: "/b.jsonl").first)
-        let gateway = try XCTUnwrap(OpenAgentParser.pi(Data(piLines(provider: "openrouter", model: "gpt-5.6-luna").utf8), path: "/c.jsonl").first)
-        let call = luna.events[0]
-        XCTAssertNotEqual(call.agentId, route.events[0].agentId, "each route stays its own consumer")
-        let kinds = TokenKinds(tokensIn: call.tokensIn, tokensOut: call.tokensOut, cacheRead: call.cacheReadTokens, cacheWrite: call.cacheWriteTokens)
-        let price = try XCTUnwrap(ModelCatalog.cost(agentId: "codex-model:gpt-5.6-luna", kinds: kinds))
-        XCTAssertEqual(ModelCatalog.cost(agentId: call.agentId, kinds: kinds), price, "the same model costs the same whichever client called it")
-        XCTAssertEqual(ModelCatalog.cost(agentId: route.events[0].agentId, kinds: kinds), price, "OpenAI's API and its ChatGPT plan are both OpenAI's")
-        XCTAssertNil(ModelCatalog.cost(agentId: gateway.events[0].agentId, kinds: kinds), "a gateway sells the model at its own price")
-        let ledger = UsageLedger.inMemory(), now = self.now
-        let provider = OpenAgentUsageProvider(credentials: { [] }, sessions: { _ in .init(sessions: [luna]) }, fetchQuota: { _, _ in ProviderQuota() },
-                                              history: QuotaHistoryStore(), clock: { now }, ledger: ledger)
-        let report = try await provider.fetchUsage(agents: [], historyHours: 24)
-        let usage = try await ledger.sessionUsage(report.sessions.map(SessionUsageRequest.init))
-        XCTAssertEqual(usage[luna.id]?.listCost, price.amount, "the session's row and page show it")
-        let kimi = try XCTUnwrap(OpenAgentParser.kimi(Data(#"{"type":"usage.record","model":"kimi-code/kimi-for-coding","usageScope":"turn","time":1788800001000,"usage":{"inputOther":10,"output":5}}"#.utf8),
-                                                      path: "/.kimi-code/sessions/work/session/agents/main/wire.jsonl").first)
-        XCTAssertNil(ModelCatalog.model(for: kimi.events[0].agentId), "Kimi Code's plan id follows whichever model Moonshot ships")
-    }
-
-    func testASessionRecordedUnderTheHashedIdIsPricedWhole() async throws {
-        let luna = try XCTUnwrap(OpenAgentParser.pi(Data(piLines(model: "gpt-5.6-luna").utf8), path: "/a.jsonl").first)
-        let ledger = UsageLedger.inMemory(), now = self.now
-        // Consumers were once a hash of the route's provider and model, then the model and a hash of the provider.
-        let hashed = "pi-model:" + RecordCoding.hash(["openai-codex", "gpt-5.6-luna"])
-        let routeHashed = "pi-model:gpt-5.6-luna#" + RecordCoding.hash(["openai-codex"])
-        try await ledger.write { try $0.replace(source: OpenAgentUsageProvider.source, contribution: luna.id, events: [
-            UsageLedger.Event(key: "earlier", timestamp: now.addingTimeInterval(-20 * 86400), agentId: hashed, tokensIn: 1_000, tokensOut: 10),
-            UsageLedger.Event(key: "later", timestamp: now.addingTimeInterval(-10 * 86400), agentId: routeHashed, tokensIn: 500, tokensOut: 5),
-        ]) }
-        let provider = OpenAgentUsageProvider(credentials: { [] }, sessions: { _ in .init(sessions: [luna]) }, fetchQuota: { _, _ in ProviderQuota() },
-                                              history: QuotaHistoryStore(), clock: { now }, ledger: ledger)
-        let report = try await provider.fetchUsage(agents: [], historyHours: 24)
-        let buckets = try await ledger.buckets(since: now.addingTimeInterval(-30 * 86400))
-        XCTAssertEqual(Set(buckets.map(\.agentId)), [luna.events[0].agentId], "no unpriced twin of the same model")
-        let usage = try await ledger.sessionUsage(report.sessions.map(SessionUsageRequest.init))
-        XCTAssertEqual(usage[luna.id]?.calls, 3)
-        XCTAssertNotNil(usage[luna.id]?.listCost, "the calls recorded before are priced too")
     }
 
     func testKimiUsageRecordWinsOverStepSummaryAndLegacyStatusIsCumulative() throws {
@@ -270,34 +228,11 @@ final class OpenAgentProviderTests: XCTestCase {
         XCTAssertNil(sqlite.events[0].attribution?.pool)
     }
 
-    func testTitlesComeFromWhatEachClientKeeps() throws {
-        // OpenCode keeps its placeholder name when the title call fails.
-        let reply = #"{"role":"assistant","modelID":"m","providerID":"p","time":{"created":1788800000000},"tokens":{"input":1,"output":1},"path":{"root":"/work/app"}}"#
-        let failed = try OpenAgentParser.openCodeMessage(json(reply), id: "m", sessionID: "s", path: "/m.json", title: "New session - 2026-09-28T07:46:18.123Z")
-        XCTAssertEqual(failed?.title, "app")
-        XCTAssertEqual(try OpenAgentParser.openCodeMessage(json(reply), id: "m", sessionID: "s", path: "/m.json", title: "News update query")?.title, "News update query")
-        // Pi: the name last given, else the first message.
-        let prompt = #"{"type":"message","id":"u","timestamp":"2026-09-07T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Fix the parser\nplease"}]}}"#
-        XCTAssertEqual(try OpenAgentParser.pi(Data((piLines() + "\n" + prompt).utf8), path: "/a").first?.title, "Fix the parser")
-        let named = piLines() + "\n" + prompt + "\n" + #"{"type":"session_info","id":"i","name":"Parser work"}"#
-        XCTAssertEqual(try OpenAgentParser.pi(Data(named.utf8), path: "/a").first?.title, "Parser work")
-        XCTAssertEqual(try OpenAgentParser.pi(Data((named + "\n" + #"{"type":"session_info","id":"j","name":""}"#).utf8), path: "/a").first?.title,
-                       "Fix the parser", "an empty name clears the one given before")
-        XCTAssertEqual(try OpenAgentParser.pi(Data(piLines().utf8), path: "/a").first?.titleSource, .placeholder)
-        // Kimi Code keeps the title in the session's state.json; sub-agents keep the client's name.
-        let session = try temp().appendingPathComponent("sessions/wd/session")
-        try FileManager.default.createDirectory(at: session.appendingPathComponent("agents/main"), withIntermediateDirectories: true)
-        try #"{"title":"hello?","titleKind":"replaceable","isCustomTitle":false}"#.write(to: session.appendingPathComponent("state.json"), atomically: true, encoding: .utf8)
-        let usage = #"{"type":"usage.record","model":"kimi-for-coding","usageScope":"turn","time":1788800001000,"usage":{"inputOther":10,"output":5}}"#
-        XCTAssertEqual(try OpenAgentParser.kimi(Data(usage.utf8), path: session.appendingPathComponent("agents/main/wire.jsonl").path).first?.title, "hello?")
-        XCTAssertEqual(try OpenAgentParser.kimi(Data(usage.utf8), path: session.appendingPathComponent("agents/child/wire.jsonl").path).first?.title, "Kimi")
-    }
-
     func testSameRequestCannotMergeAcrossPools() {
         let a = credential().pool, b = credential(key: "another-account").pool
         func event(_ pool: BillingPool) -> UsageEvent {
             .init(timestamp: now, agentId: "model", tokensIn: 1, tokensOut: 2, eventID: "request",
-                  attribution: .init(client: "Pi", providerID: "kimi-code", pool: pool))
+                  attribution: .init(client: "Pi", providerID: "kimi-code", pool: pool, estimatedUSD: 0.01))
         }
         XCTAssertEqual(UsageAggregation.usageUnion([[event(a)], [event(a)], [event(b)]]).count, 2)
     }
@@ -398,28 +333,28 @@ final class OpenAgentProviderTests: XCTestCase {
         XCTAssertEqual(sessions[0].events.first?.attribution?.providerID, "opencode-go")
     }
 
-    func testOpenCodeReadsEachSessionFromTheTableHoldingItsReplies() throws {
+    func testOpenCodePlatformOnlySessionMessageFallsBackToMessageTable() throws {
         let url = try temp().appendingPathComponent("opencode.db")
         var db: OpaquePointer?
         XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
         defer { sqlite3_close(db) }
-        func reply(_ id: String, _ session: String) -> String {
-            #"{"id":"\#(id)","sessionID":"\#(session)","role":"assistant","modelID":"glm-5.1","providerID":"zai-coding-plan","time":{"created":1788800000000},"tokens":{"input":10,"output":1}}"#
-        }
+        let raw = #"{"role":"assistant","modelID":"model-v3","providerID":"opencode","time":{"created":1788800000000},"tokens":{"input":100,"output":40,"reasoning":3,"cache":{"read":500,"write":7}}}"#
         let statements = [
             "CREATE TABLE session(id TEXT, title TEXT, directory TEXT)",
             "CREATE TABLE message(id TEXT, session_id TEXT, data TEXT)",
             "CREATE TABLE session_message(id TEXT, session_id TEXT, type TEXT, data TEXT)",
-            "INSERT INTO session VALUES ('old', 'Old kind', '/a'), ('new', 'New kind', '/b')",
-            "INSERT INTO message VALUES ('m1', 'old', '\(reply("m1", "old"))'), ('m2', 'new', '\(reply("m2", "new"))')",
-            // A switch comes before any reply of the newer kind; that reply names another id than the same one in `message`.
-            #"INSERT INTO session_message VALUES ('e1','old','model-switched','{"time":{"created":1788800000000}}')"#,
-            #"INSERT INTO session_message VALUES ('e2','new','assistant','{"model":{"id":"glm-5.1","providerID":"zai-coding-plan"},"time":{"created":1788800000000},"tokens":{"input":10,"output":1}}')"#,
+            "INSERT INTO session VALUES ('s', 'V3 task', '/workspace')",
+            "INSERT INTO message VALUES ('m', 's', '\(raw)')",
+            #"INSERT INTO session_message VALUES ('e','s','model-switched','{"time":{"created":1788800000000}}')"#,
         ]
         for statement in statements { XCTAssertEqual(sqlite3_exec(db, statement, nil, nil, nil), SQLITE_OK) }
         let sessions = try OpenAgentParser.openCodeSQLite(url)
-        XCTAssertEqual(sessions.map(\.title).sorted(), ["New kind", "Old kind"])
-        XCTAssertEqual(sessions.flatMap(\.events).compactMap(\.eventID).sorted(), ["opencode:e2", "opencode:m1"], "a reply counts once")
+        XCTAssertEqual(sessions.count, 1)
+        XCTAssertEqual(sessions[0].title, "V3 task")
+        XCTAssertEqual(sessions[0].models.values.first, "model-v3")
+        XCTAssertEqual(sessions[0].events.first?.tokensIn, 107)
+        XCTAssertEqual(sessions[0].events.first?.tokensOut, 43)
+        XCTAssertEqual(sessions[0].events.first?.cacheReadTokens, 500)
     }
 
     private struct FixedProvider: UsageProvider {

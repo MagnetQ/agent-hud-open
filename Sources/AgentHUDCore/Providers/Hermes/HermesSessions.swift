@@ -27,7 +27,7 @@ enum HermesSessions: LocalSessionLayout {
     static func read(_ url: URL, since: Date) throws -> ProviderSessions {
         let db = try ReadOnlySQLite(url)
         var tables = Set<String>()
-        try db.rows("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('sessions', 'session_model_usage')") { row in
+        try db.rows("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('sessions', 'messages', 'session_model_usage')") { row in
             if let name = ReadOnlySQLite.text(row, 0) { tables.insert(name) }
         }
         guard tables.contains("sessions") else { throw ProviderFailure.format }
@@ -76,7 +76,51 @@ enum HermesSessions: LocalSessionLayout {
                 timestamp: rows ? seconds(row, 25) ?? started : started, input: try TokenCount.sum(input, write), output: output, cacheRead: read,
                 cacheWrite: write))
         }
+        // Hermes records the end of a turn itself; only the newest record of a session may speak for it.
+        for turn in try endedTurns(db, since: since, profile: profile) {
+            guard let session = sessions[turn.session] else { continue }
+            sessions[turn.session]?.completions.append(SessionCompletion(
+                sessionID: session.id, vendor: session.client, turnID: turn.id, task: session.title,
+                model: turn.model ?? session.client, startedAt: turn.startedAt, completedAt: turn.completedAt))
+        }
         return ProviderSessions(sessions: sessions.keys.sorted().compactMap { sessions[$0] })
+    }
+
+    /// The answer that ended a turn: Hermes writes `finish_reason` when an answer is done, and an answer that asked for no
+    /// tool ends with the user waited on. Only the newest message of a session is considered, so a tool loop in flight stays
+    /// silent, and a session an agent spawned never stands in for the conversation that spawned it.
+    private static func endedTurns(_ db: ReadOnlySQLite, since: Date, profile: String?)
+        throws -> [(session: String, id: String, model: String?, startedAt: Date?, completedAt: Date)] {
+        var columns: [String: Set<String>] = [:]
+        for table in ["messages", "sessions"] {
+            var names = Set<String>()
+            try db.rows("SELECT name FROM pragma_table_info(?)", strings: [table]) { row in
+                if let name = ReadOnlySQLite.text(row, 0) { names.insert(name) }
+            }
+            columns[table] = names
+        }
+        let messages = columns["messages"] ?? [], sessions = columns["sessions"] ?? []
+        guard messages.contains("finish_reason"), messages.contains("tool_calls"), messages.contains("timestamp"),
+              sessions.contains("model"), sessions.contains("parent_session_id") else { return [] }
+        var turns: [(session: String, id: String, model: String?, startedAt: Date?, completedAt: Date)] = []
+        try db.rows("""
+            SELECT m.id, m.session_id, s.model, m.timestamp,
+                (SELECT MAX(u.timestamp) FROM messages u
+                    WHERE u.session_id = m.session_id AND u.role = 'user' AND u.timestamp <= m.timestamp)
+            FROM messages m JOIN sessions s ON s.id = m.session_id
+            WHERE m.role = 'assistant' AND m.finish_reason IS NOT NULL AND m.finish_reason <> 'tool_calls'
+                AND m.timestamp = (SELECT MAX(n.timestamp) FROM messages n WHERE n.session_id = m.session_id)
+                AND s.parent_session_id IS NULL
+                AND m.timestamp >= CAST(? AS REAL)
+            ORDER BY m.timestamp DESC
+            """, strings: [String(since.timeIntervalSince1970)]) { row in
+            guard let turn = ReadOnlySQLite.text(row, 0), let raw = ReadOnlySQLite.text(row, 1),
+                  let completed = seconds(row, 3) else { throw ProviderFailure.format }
+            let id = "hermes:" + (profile.map { "\($0):" } ?? "") + raw
+            turns.append((session: id, id: turn, model: ReadOnlySQLite.text(row, 2),
+                          startedAt: seconds(row, 4), completedAt: completed))
+        }
+        return turns
     }
 
     private static func seconds(_ row: OpaquePointer, _ column: Int32) -> Date? {
