@@ -21,6 +21,7 @@ public enum PermissionHooks {
         case workbuddy
         case zcode
         case qwen
+        case opencode
 
         public var vendor: String {
             switch self {
@@ -33,6 +34,7 @@ public enum PermissionHooks {
             case .workbuddy: return "WorkBuddy"
             case .zcode: return "ZCode"
             case .qwen: return "Qwen"
+            case .opencode: return "OpenCode"
             }
         }
 
@@ -42,7 +44,7 @@ public enum PermissionHooks {
         /// the client's own, and the Qoder builds report no sessions.
         func sessionID(_ raw: String) -> String {
             switch self {
-            case .codebuddy, .workbuddy, .zcode, .qwen: return "\(rawValue):\(raw)"
+            case .codebuddy, .workbuddy, .zcode, .qwen, .opencode: return "\(rawValue):\(raw)"
             case .claude, .codex, .qoder, .qoderCN, .qoderWork: return raw
             }
         }
@@ -52,7 +54,7 @@ public enum PermissionHooks {
         var supportsPermissionUpdates: Bool {
             switch self {
             case .claude, .qoder, .qoderCN, .qoderWork: return true
-            case .codex, .codebuddy, .workbuddy, .zcode, .qwen: return false
+            case .codex, .codebuddy, .workbuddy, .zcode, .qwen, .opencode: return false
             }
         }
         /// Matched against the tool name; empty is every tool. ZCode rejects an empty matcher and runs a group without
@@ -69,7 +71,8 @@ public enum PermissionHooks {
             switch self {
             case .zcode: return ["AskUserQuestion", "ExitPlanMode"]
             case .qwen: return ["ask_user_question", "exit_plan_mode"]
-            case .qoder, .qoderCN, .qoderWork, .codebuddy, .workbuddy: return ["AskUserQuestion", "ExitPlanMode"]
+            case .qoder, .qoderCN, .qoderWork, .codebuddy, .workbuddy, .opencode:
+                return ["AskUserQuestion", "ExitPlanMode"]
             case .claude, .codex: return []
             }
         }
@@ -93,6 +96,7 @@ public enum PermissionHooks {
             case .workbuddy: return ".workbuddy"
             case .zcode: return ".zcode/cli"
             case .qwen: return ".qwen"
+            case .opencode: return "opencode"
             }
         }
 
@@ -102,10 +106,18 @@ public enum PermissionHooks {
             if case .qwen = self { return QwenSessions.home(base) }
             // Claude Code's configuration directory moves with CLAUDE_CONFIG_DIR; the forks have no such variable.
             if case .claude = self, let configured = ClaudeSubscription.configDirectory { return configured }
+            // OpenCode keeps its configuration under XDG_CONFIG_HOME/opencode (defaulting to ~/.config).
+            if case .opencode = self {
+                let env = ProcessInfo.processInfo.environment
+                let root = URL(fileURLWithPath: env["XDG_CONFIG_HOME"] ?? base.appendingPathComponent(".config").path)
+                return root.appendingPathComponent("opencode", isDirectory: true)
+            }
             return base.appendingPathComponent(directory, isDirectory: true)
         }
 
         func configuration(home base: URL) -> URL {
+            // OpenCode has no settings.json; the plugin file under plugins/ is what carries the hook.
+            if case .opencode = self { return OpenCodeHookInstaller.pluginURL(home: base) }
             let name: String
             switch self {
             case .codex: name = "hooks.json"
@@ -127,6 +139,14 @@ public enum PermissionHooks {
             // The session folder is what the usage provider reads; a settings folder alone can be the IDE extension's.
             case .codebuddy, .workbuddy:
                 return fileManager.fileExists(atPath: self.home(home).appendingPathComponent("projects").path)
+            case .opencode:
+                let env = ProcessInfo.processInfo.environment
+                let xdgData = URL(fileURLWithPath: env["XDG_DATA_HOME"]
+                                  ?? home.appendingPathComponent(".local/share").path)
+                let xdgConfig = URL(fileURLWithPath: env["XDG_CONFIG_HOME"]
+                                    ?? home.appendingPathComponent(".config").path)
+                return fileManager.fileExists(atPath: xdgData.appendingPathComponent("opencode").path)
+                    || fileManager.fileExists(atPath: xdgConfig.appendingPathComponent("opencode").path)
             }
         }
     }
