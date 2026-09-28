@@ -39,7 +39,9 @@ public struct UsageAttribution: Hashable, Codable, Sendable {
     public let client: String
     public let providerID: String
     public let pool: BillingPool?
-    public init(client: String, providerID: String, pool: BillingPool? = nil) {
-        self.client = client; self.providerID = providerID; self.pool = pool
+    /// What the vendor itself reported for the call, kept as the vendor recorded it.
+    public let estimatedUSD: Decimal?
+    public init(client: String, providerID: String, pool: BillingPool? = nil, estimatedUSD: Decimal? = nil) {
+        self.client = client; self.providerID = providerID; self.pool = pool; self.estimatedUSD = estimatedUSD
     }
 }

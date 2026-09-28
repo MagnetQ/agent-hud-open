@@ -38,6 +38,7 @@ struct OpenAgentSession: Sendable {
     var id: String
     var client: OpenAgentSource
     var title: String
+    var titleSource = TitleSource.log
     var workspace: String?
     var path: String
     var events: [UsageEvent] = []
@@ -47,6 +48,10 @@ struct OpenAgentSession: Sendable {
     var end: Date?
     var turns: [SessionTurn] = []
     var completions: [SessionCompletion] = []
+
+    /// Which copy's title wins when copies of one session merge: a name or first prompt from the session's own log,
+    /// then the name Pi's observer saw when a turn settled, then a name standing in for a missing title.
+    enum TitleSource: Comparable, Sendable { case placeholder, observer, log }
 
     mutating func setModel(_ model: String, provider: String) {
         let id = "\(client.rawValue)-model:" + RecordCoding.hash([provider, model])
@@ -125,12 +130,30 @@ enum OpenAgentParser {
         return session.map { [$0] } ?? []
     }
 
+    /// The session folder of a Kimi wire log (Kimi Code's `<session>/agents/<agent>/wire.jsonl`, or kimi-cli's
+    /// `<session>/wire.jsonl`) and the agent that wrote it.
+    static func kimiSession(_ wire: URL) -> (folder: URL, agent: String, modern: Bool) {
+        let directory = wire.deletingLastPathComponent()
+        guard directory.deletingLastPathComponent().lastPathComponent == "agents" else { return (directory, "main", false) }
+        return (directory.deletingLastPathComponent().deletingLastPathComponent(), directory.lastPathComponent, true)
+    }
+
+    /// The title in the session's `state.json`: Kimi Code's first prompt until a generated title or a `/title` replaces
+    /// it, or the `/title` kimi-cli kept as `custom_title`.
+    static func kimiTitle(_ folder: URL) -> String? {
+        let state = (try? ProviderFiles.json(folder.appendingPathComponent("state.json"))) ?? .null
+        return (SessionTitle.named(state["title"].stringValue) ?? SessionTitle.named(state["custom_title"].stringValue))
+            .flatMap { $0 == "New Session" ? nil : $0 }
+    }
+
     static func kimi(_ data: Data, path: String) throws -> [OpenAgentSession] {
-        let file = URL(fileURLWithPath: path), directory = file.deletingLastPathComponent()
-        let modern = directory.deletingLastPathComponent().lastPathComponent == "agents"
-        let sessionID = modern ? directory.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent : directory.lastPathComponent
-        let agent = modern ? directory.lastPathComponent : "main"
-        var session = OpenAgentSession(id: "kimi:\(sessionID):\(agent)", client: .kimi, title: "Kimi", path: path)
+        let file = URL(fileURLWithPath: path)
+        let (folder, agent, modern) = kimiSession(file)
+        let sessionID = folder.lastPathComponent
+        let named = kimiTitle(folder)
+        var session = OpenAgentSession(id: "kimi:\(sessionID):\(agent)", client: .kimi, title: named ?? "Kimi", path: path)
+        // A stand-in name yields to any name the log or Pi's observer carries.
+        if named == nil { session.titleSource = .placeholder }
         var requestModel: String?, keyed: [String: Int] = [:]
         func concrete(_ name: String?) -> String? {
             guard let name, !name.isEmpty, !name.hasPrefix("__") else { return nil }; return name
