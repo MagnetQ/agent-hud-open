@@ -53,8 +53,10 @@ struct OpenAgentSession: Sendable {
     /// then the name Pi's observer saw when a turn settled, then a name standing in for a missing title.
     enum TitleSource: Comparable, Sendable { case placeholder, observer, log }
 
+    /// A consumer is the model as the log names it and, after `#`, the provider the calls went through: routes to one
+    /// model stay apart, and the price catalog prices only the vendor's own.
     mutating func setModel(_ model: String, provider: String) {
-        let id = "\(client.rawValue)-model:" + RecordCoding.hash([provider, model])
+        let id = "\(client.rawValue)-model:\(model)#\(provider)"
         models[id] = model
         currentModel = (id, model, provider)
     }
@@ -100,10 +102,14 @@ enum OpenAgentParser {
             if type == "session", let id = line["id"].stringValue {
                 session = .init(id: "pi:\(id)", client: .pi, title: "Pi", workspace: line["cwd"].stringValue, path: path,
                                 start: ProviderDate.iso(line["timestamp"].stringValue))
+                // A stand-in name yields to any name the log or Pi's observer carries.
+                session?.titleSource = .placeholder
                 return
             }
             guard session != nil else { return }
-            if type == "session_info", let name = line["name"].stringValue { session?.title = name; return }
+            if type == "session_info", let name = SessionTitle.named(line["name"].stringValue) {
+                session?.title = name; session?.titleSource = .log; return
+            }
             if type == "model_change", let model = line["modelId"].stringValue, let provider = line["provider"].stringValue {
                 session?.setModel(model, provider: provider)
                 return
