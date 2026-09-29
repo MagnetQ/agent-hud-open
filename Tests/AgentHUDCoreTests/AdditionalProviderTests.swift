@@ -312,6 +312,29 @@ final class AdditionalProviderTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(kinds, [0])
     }
 
+    func testLinesWithoutAMarkerAreNumberedButNotDecoded() throws {
+        let url = try file("session.jsonl", "{\"kind\":0}\nnot json\n\n{\"kind\":1,\"usage\":{}}\n{\"usage\":{},\"kind\":2}")
+        var read: [Int: Int] = [:]
+        try ProviderFiles.lines(url, markers: [Data(#""usage""#.utf8)]) { value, line in read[line] = value["kind"].countValue }
+        XCTAssertEqual(read, [4: 1, 5: 2], "skipped and empty lines keep their numbers")
+    }
+
+    func testGrokReadsEveryModelMessageAndSkipsOtherLogLines() throws {
+        let url = try file("unified.jsonl", """
+        {"pid":1,"sid":"a","msg":"backend_search: model switch","ctx":{"new_model":"search-model"}}
+        {"pid":1,"sid":"b","msg":"model changed","ctx":{"model":"changed-model"}}
+        {"pid":1,"sid":"c","msg":"model catalog: notifying clients","ctx":{"current_model_id":"catalog-model"}}
+        {"pid":1,"sid":"a","msg":"render frame","ctx":{"detail":"never decoded
+        {"pid":1,"sid":"a","ts":"2026-09-07T16:53:20.100Z","msg":"shell.turn.inference_done","ctx":{"prompt_tokens":1,"completion_tokens":2}}
+        {"pid":1,"sid":"b","ts":"2026-09-07T16:53:21.200Z","msg":"shell.turn.inference_done","ctx":{"prompt_tokens":3,"completion_tokens":4}}
+        {"pid":1,"sid":"c","ts":"2026-09-07T16:53:22.300Z","msg":"shell.turn.inference_done","ctx":{"prompt_tokens":5,"completion_tokens":6}}
+
+        """)
+        let sessions = try GrokSessions.read(url).sessions
+        XCTAssertEqual(sessions.map(\.id), ["grok:a", "grok:b", "grok:c"])
+        XCTAssertEqual(sessions.flatMap(\.events).map(\.model), ["search-model", "changed-model", "catalog-model"])
+    }
+
     func testAdditionalProviderCachesQuotaAndStillReportsLocalUsageWhenSignedOut() async throws {
         let now = now, history = QuotaHistoryStore()
         let provider = AdditionalUsageProvider(source: .grok, readQuota: { ProviderQuota(windows: [.init(id: "grok", label: "Credits", remaining: 80)]) },
@@ -334,6 +357,43 @@ final class AdditionalProviderTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(localUsage.count, 1, "a signed-out source still records local usage")
         XCTAssertTrue(local.snapshots.isEmpty)
         XCTAssertNotNil(local.sourceNotices["Grok"])
+    }
+
+    @MainActor
+    func testOnlyAFailedQuotaReadHoldsBackAlertsAndLevels() async throws {
+        final class Readings: @unchecked Sendable {
+            var remaining: [Double?], now: Date
+            init(_ remaining: [Double?], now: Date) { self.remaining = remaining; self.now = now }
+        }
+        let readings = Readings([50, 5, nil], now: now), reset = now.addingTimeInterval(86400)
+        let provider = RetainedUsageProvider(provider: AdditionalUsageProvider(source: .cursor, readQuota: {
+            guard let remaining = readings.remaining.removeFirst() else { throw ProviderFailure.login("Cursor") }
+            return ProviderQuota(windows: [.init(id: "cursor", label: "Included", remaining: remaining, reset: reset)])
+        }, readSessions: { _ in ProviderSessions(notice: "Cursor usage events could not be read") }, history: QuotaHistoryStore(),
+           readCompletions: { _ in throw ProviderFailure.local }, clock: { readings.now }))
+        let suite = "AdditionalProviderTests.\(UUID().uuidString)", defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var tracker = QuotaAlertTracker()
+        let first = try await provider.fetchAccountAndLocalUsage(agents: [], historyHours: 48)
+        let row = try XCTUnwrap(first.discoveredAgents.first)
+        let store = UsageStore(provider: DemoUsageProvider(), settings: SettingsStore(defaults: defaults, defaultAgents: [row]))
+        _ = tracker.update(report: first, agents: [row], now: readings.now)
+
+        readings.now = now.addingTimeInterval(UsageRefresh.accountRequestSpacing)
+        let low = try await provider.fetchAccountAndLocalUsage(agents: [], historyHours: 48)
+        XCTAssertEqual(low.sourceNotices["Cursor"]?.hasPrefix("Cursor usage events could not be read · "), true, "local and hook notices stay shown")
+        XCTAssertEqual(tracker.update(report: low, agents: [row], now: readings.now).criticalAgentIDs, [row.id])
+        store.replace(report: low)
+        store.now = readings.now
+        XCTAssertEqual(store.rows.map(\.level), [.critical])
+
+        readings.now = now.addingTimeInterval(2 * UsageRefresh.accountRequestSpacing)
+        let failed = try await provider.fetchAccountAndLocalUsage(agents: [], historyHours: 48)
+        XCTAssertEqual(failed.snapshot(for: row.id)?.remainingPct, 5, "the last reading stays shown")
+        XCTAssertNotNil(failed.quotaNotice(for: row))
+        store.replace(report: failed)
+        store.now = readings.now
+        XCTAssertEqual(store.rows.map(\.level), [nil], "a failed read still takes the window out of the glow")
     }
 
     /// Explicit local smoke probe. Prints only counts and sanitized provider errors; never credential values or session content.

@@ -10,7 +10,7 @@ Which clients expose running and terminal turns, which of them say they are wait
 
 | Client | Running turns | Terminal turns | Evidence |
 | --- | --- | --- | --- |
-| Claude Code | Yes | Yes | A prompt line starts the turn; an assistant `stop_reason` of `end_turn` or `stop_sequence` completes it; a `[Request interrupted` user line ends it; `tool_use` keeps it running. `isSidechain` lines, `<synthetic>` messages (API errors) and sub-agent transcripts never start or finish a turn. The turn's message is the latest assistant text block, and its notification hook reports waiting for approval. |
+| Claude Code | Yes | Yes | A prompt line starts the turn, but a slash command Claude Code runs itself, such as `/exit`, `/clear` or `/model`, and its output do not; an assistant `stop_reason` of `end_turn` or `stop_sequence` completes it; a `[Request interrupted` user line ends it; `tool_use` keeps it running, and a working assistant line after the turn stopped, with no prompt before it (a sub-agent's report, a queued notification, a Stop hook's feedback), resumes it. Attachment and queue records never date a turn. `isSidechain` lines and `<synthetic>` messages (API errors) never start or finish a turn, and the session's sub-agents keep it running ([Sub-agents](#sub-agents)). The turn's message is the latest assistant text block, and its notification hook reports waiting for approval. |
 | Codex Desktop / CLI | Yes | Yes | `task_started` (`turn_id`) starts the turn and later events refresh it; `task_complete` completes it; `turn_aborted` ends it; an `agent_message` is the running turn's message. Guardian and sub-agent rollouts report none. |
 | DeepSeek Harness | Yes | Yes | `turn/start`, later step, message and tool events (format 0 also logs streaming chunks), `turn/end`; only `reason.kind == completed` is a completion, and sub-agent sessions and inherited fork history record none. A quiet turn stays active while a Node process that predates it holds the Harness profile. |
 | Grok CLI | Yes | Yes | Session updates keyed by `promptId`; `turn_completed` with `stop_reason` `end_turn` completes, other outcomes end without a completion. Older unified logs carry usage only. |
@@ -38,6 +38,12 @@ Which clients expose running and terminal turns, which of them say they are wait
 - Process evidence is separate from the last recorded observation: a quiet process does not manufacture a transcript event, and a disappeared process does not prove completion.
 - The island announces each completed turn once, for clients whose Live status is on (`IslandEventTracker`). Completions that happened before the application started are history, not events, and turns that finished while Live status was off are not replayed when it is turned back on.
 - Hosts that relay completions use the island's update rather than deciding again, and apply the same preference in any other relay or synchronization service.
+
+### Sub-agents
+
+- A Claude Code session also runs while the sub-agents and workflow agents it started work, after its own agent ended its turn or went quiet waiting for them. Their logs sit in a directory named after the session's log (`<session>/subagents/`, workflow agents under `workflows/<run>/`), and their latest activity is the session's latest event.
+- Each of those logs follows its own turn: its prompt starts it; `end_turn`, a `StructuredOutput` call (a workflow agent handing back its result) or a `[Request interrupted` line ends it; 30 quiet minutes abandon it, as for any running turn. An agent stopped without any of these, such as one closed with its session, keeps the session running until then.
+- The session's turn keeps its id and start while its agents work. Sub-agent logs report no completions and mark no prompts, so the agent's own answer is still announced when it ends its turn.
 
 ### Pi observer
 
@@ -70,7 +76,10 @@ Antigravity, Cursor, GitHub Copilot CLI, CodeBuddy and Qwen Code do not record f
 | Qwen Code | Group appended to `hooks.Stop` of `settings.json` in `$QWEN_HOME` (default `~/.qwen`), timeout 5000 ms; only commands ending in ` --completion-hook qwen` are Agent HUD's | `hook_event_name` is `Stop` and `session_id` is present; the turn is `prompt_id` (0.23.4 and later), else the callback time. A cancelled or failed turn runs no `Stop` |
 
 - The handler command is `'<executable path>' --completion-hook <source>` with a 5-second timeout, written in the client's own unit. Other hooks in the file are preserved, and a file that already contains the identical configuration is not rewritten.
-- Automatic setup never replaces a handler that points at a different executable: the existing installation keeps the hook and the conflict is logged. Moving or reinstalling the application does not update the path; `--install-completion-hook <source>` takes ownership explicitly ([command line](command-line.md#adapter-commands)). Installing a hook never starts, restarts or interrupts the client and consumes no quota. With Settings → General → Client hooks off, start-up installs none and removes this installation's handlers.
+- A handler whose installation is gone is replaced, or removed while Client hooks are off: its executable no longer exists, or lies under App Translocation or `/Volumes`, where an app runs when it is first opened from Downloads or from its disk image. Moving the application to its final place therefore moves its hooks at the next start.
+- A handler another installation still answers stays with it: automatic setup logs the conflict and leaves it, and so does switching Client hooks off. `--install-completion-hook <source>` takes it over explicitly ([command line](command-line.md#adapter-commands)); once that installation switches Client hooks off, this one adds its own at its next start.
+- An application running from under App Translocation or `/Volumes` installs no hook and logs why. Installing a hook never starts, restarts or interrupts the client and consumes no quota.
+- With Settings → General → Client hooks off, start-up installs none and removes this installation's handlers.
 - The handler reads the payload from standard input and writes one JSON record per completion to `turn-completions/<source>/<id>.json` in the data directory: id, `sessionID` (`<source>:<conversation id>`), vendor, task (vendor plus workspace folder name), model when the payload names one, and receipt time. No prompt, tool argument, credential or e-mail address is stored.
 - An existing record for the same id is left untouched, so repeated callbacks create no duplicates; records older than 30 days are deleted on the next write.
 - The handler prints `{"decision":"stop"}` for Antigravity and `{}` for the other clients and exits 0 even when recording fails, so status tracking can never block the agent.
@@ -83,10 +92,11 @@ Antigravity, Cursor, GitHub Copilot CLI, CodeBuddy and Qwen Code do not record f
 | Turn, completion and session models | `Sources/AgentHUDCore/Models/SessionTurn.swift`, `SessionCompletion.swift`, `LiveSession.swift` |
 | Live status preference and desktop liveness | `Sources/AgentHUDCore/Models/Settings.swift`, `Sources/AgentHUDCore/Store/UsageStore.swift` |
 | Completion reminders | `Sources/AgentHUDCore/Logic/IslandEvents.swift`, `Sources/AgentHUDDesktop/App/DesktopApplication.swift` |
-| Adapter setup | `Sources/AgentHUDCore/Providers/SessionObservers.swift` |
+| Adapter setup, and which installation a handler belongs to | `Sources/AgentHUDCore/Providers/SessionObservers.swift`, `Shared/HookCommand.swift` |
 | Completion hooks and handler entry | `Sources/AgentHUDCore/Providers/Additional/CompletionHooks.swift`, `Sources/AgentHUDOpenApp/main.swift` |
 | Pi observer and its extension script | `Sources/AgentHUDCore/Providers/OpenAgents/PiSessionObserver.swift` |
 | Per-client turn parsing | `Sources/AgentHUDCore/Providers/Claude/ClaudeTranscripts.swift`, `Codex/CodexTranscripts.swift`, `DeepSeek/DeepSeekTranscript.swift`, `Grok/GrokSessions.swift`, `OpenAgents/OpenAgentSessions.swift` |
+| Claude sub-agents keeping their session running | `Sources/AgentHUDCore/Providers/Claude/ClaudeCodeProvider.swift` |
 
 ## Related
 

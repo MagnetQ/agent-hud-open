@@ -22,6 +22,14 @@ final class PermissionHookTests: XCTestCase, @unchecked Sendable {
          "tool_name": tool, "tool_input": input]
     }
 
+    /// A file standing in for an installed app's executable: one that exists is an installation still here.
+    private func app(_ name: String, in folder: URL) throws -> URL {
+        let url = folder.appendingPathComponent("\(name).app/Contents/MacOS/\(name)")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: url)
+        return url
+    }
+
     func testTheHookIsInstalledBesideWhateverElseTheSettingsHold() throws {
         let home = try directory()
         let settings = home.appendingPathComponent(".claude/settings.json")
@@ -95,7 +103,7 @@ final class PermissionHookTests: XCTestCase, @unchecked Sendable {
             "PermissionRequest": [["matcher": "Bash", "hooks": [["type": "command", "command": "echo check"]]]],
         ]]
         try JSONSerialization.data(withJSONObject: original).write(to: hooks)
-        let executable = URL(fileURLWithPath: "/Applications/Agent HUD.app/Contents/MacOS/Agent HUD")
+        let executable = try app("Agent HUD", in: try directory())
         try PermissionHooks.configure(.codex, enabled: true, executable: executable, home: home)
         let installed = try Data(contentsOf: hooks)
         try PermissionHooks.configure(.codex, enabled: true, executable: executable, home: home)
@@ -113,6 +121,50 @@ final class PermissionHookTests: XCTestCase, @unchecked Sendable {
         try PermissionHooks.configure(.codex, enabled: false, executable: executable, home: home)
         XCTAssertEqual(try ProviderJSON.read(Data(contentsOf: hooks)),
                        try ProviderJSON.read(JSONSerialization.data(withJSONObject: original)), "other hooks are preserved")
+    }
+
+    func testAHandlerNothingAnswersIsReplacedInEveryClientsFormat() throws {
+        let apps = try directory()
+        let current = try app("Agent HUD", in: apps.appendingPathComponent("Applications"))
+        // The quote in its name is written escaped, and read back to find the app still there.
+        let other = try app("Agent's HUD", in: apps.appendingPathComponent("Applications"))
+        // Where an app ran before it was moved: a translocated copy still mounted, its disk image, a deleted app.
+        let left = [try app("Agent HUD", in: apps.appendingPathComponent("AppTranslocation/5D1C/d")),
+                    URL(fileURLWithPath: "/Volumes/Agent HUD/Agent HUD.app/Contents/MacOS/Agent HUD"),
+                    apps.appendingPathComponent("Trash/Agent HUD.app/Contents/MacOS/Agent HUD")]
+        for source in PermissionHooks.Source.allCases {
+            let home = try directory(), file = source.configuration(home: home)
+            let ours = { HookCommand.make(executable: $0, arguments: "--permission-hook \(source.rawValue)") }
+            let installed = { PermissionHooks.commands(in: try PermissionHooks.configuration(source, home: home), source: source) }
+            for running in ["/Volumes/Agent HUD/Agent HUD.app/Contents/MacOS/Agent HUD", left[0].path] {
+                XCTAssertThrowsError(try PermissionHooks.configure(source, enabled: true, executable: URL(fileURLWithPath: running),
+                                                                   home: home))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "\(source): an app running from \(running) adds nothing")
+            }
+            for old in left {
+                try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(ProviderJSON.object(try PermissionHooks.updating([:], source: source, command: ours(old))))
+                    .write(to: file)
+                try PermissionHooks.configure(source, enabled: true, executable: current, home: home)
+                XCTAssertEqual(try installed(), [ours(current)], "\(source): the handler left at \(old.path) is replaced")
+            }
+
+            try PermissionHooks.configure(source, enabled: true, executable: other, home: home, replacingExisting: true)
+            let taken = try Data(contentsOf: file)
+            XCTAssertThrowsError(try PermissionHooks.configure(source, enabled: true, executable: current, home: home))
+            XCTAssertEqual(try Data(contentsOf: file), taken, "\(source): an installation that is still here keeps its handler")
+            try PermissionHooks.configure(source, enabled: false, executable: current, home: home)
+            XCTAssertEqual(try Data(contentsOf: file), taken, "\(source): and keeps it when this one switches hooks off")
+
+            // Beside it, this installation's own handler and one nothing answers any more.
+            var three = try PermissionHooks.updating(try PermissionHooks.configuration(source, home: home), source: source,
+                                                     command: ours(left[2]), keeping: [ours(other)])
+            three = try PermissionHooks.updating(three, source: source, command: ours(current), keeping: [ours(other), ours(left[2])])
+            try JSONEncoder().encode(ProviderJSON.object(three)).write(to: file)
+            XCTAssertEqual(Set(try installed()), [ours(other), ours(left[2]), ours(current)])
+            try PermissionHooks.configure(source, enabled: false, executable: current, home: home)
+            XCTAssertEqual(try installed(), [ours(other)], "\(source): switching hooks off takes out this one's and the one left behind")
+        }
     }
 
     func testCodexHomeUsesTheSameResolverAsItsUsageProvider() throws {
@@ -312,6 +364,36 @@ final class PermissionHookTests: XCTestCase, @unchecked Sendable {
         XCTAssertNil(try PermissionRequest.parse(JSONSerialization.data(withJSONObject: ["tool_name": "Bash"]),
                                                  source: .claude, id: "4", now: now),
                      "a request that names no session cannot be shown beside one")
+    }
+
+    func testWhatAnAllowLetsRunIsAlwaysThereToRead() throws {
+        func parse(_ tool: String, _ input: [String: Any], source: PermissionHooks.Source = .claude,
+                   suggestions: [[String: Any]] = []) throws -> PermissionRequest {
+            var body = payload(tool: tool, input: input)
+            body["permission_suggestions"] = suggestions
+            return try XCTUnwrap(try PermissionRequest.parse(JSONSerialization.data(withJSONObject: body), source: source, id: tool, now: now))
+        }
+        let bare = try parse("Bash", ["command": "npm test -- --watch=false"])
+        XCTAssertEqual([bare.summary, bare.detail], ["npm test -- --watch=false", "npm test -- --watch=false"],
+                       "a command without a description is still there in full, not only as a one-line summary")
+
+        let write = try parse("Write", ["file_path": "/Users/me/agent-hud/notes.md", "content": "# Notes\nFirst line"])
+        XCTAssertNil(write.removed)
+        XCTAssertEqual(write.added, "# Notes\nFirst line", "a new file's content is what is written")
+        XCTAssertEqual(try parse("write_file", ["file_path": "/tmp/notes.md", "content": "hello"], source: .qwen).added, "hello")
+        let notebook = try parse("NotebookEdit", ["notebook_path": "/Users/me/agent-hud/eda.ipynb", "new_source": "df.describe()"])
+        XCTAssertEqual([notebook.summary, notebook.path, notebook.added], ["eda.ipynb", "/Users/me/agent-hud/eda.ipynb", "df.describe()"])
+
+        let mcp = try parse("mcp__linear__create_issue", ["title": "Crash on launch", "team": "MOB", "labels": ["bug"], "content": "Steps"])
+        XCTAssertEqual(mcp.detail, "content: Steps\nlabels: [\"bug\"]\nteam: MOB\ntitle: Crash on launch", "an MCP call shows its arguments")
+        XCTAssertNil(mcp.added, "another tool's content is an argument, not an edit")
+
+        let rules: [String: Any] = ["type": "addRules", "behavior": "allow", "destination": "localSettings",
+                                    "rules": [["toolName": "Bash", "ruleContent": "npm test:*"], ["toolName": "WebSearch"]]]
+        XCTAssertEqual(try parse("Bash", ["command": "npm test"], suggestions: [rules]).alwaysAllowRule, "Bash(npm test:*), WebSearch",
+                       "Always allow names the rules it adds, as the client writes them")
+        let unnamed: [String: Any] = ["type": "addRules", "behavior": "allow", "rules": [["ruleContent": "npm test:*"]]]
+        XCTAssertNil(try parse("Bash", ["command": "npm test"], suggestions: [unnamed]).alwaysAllow, "a rule that cannot be read is not offered")
     }
 
     private let questions: [[String: Any]] = [

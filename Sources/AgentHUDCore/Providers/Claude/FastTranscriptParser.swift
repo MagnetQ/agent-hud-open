@@ -40,6 +40,8 @@ public enum FastTranscriptParser {
     private static let contentTextKey = Array("\"content\":[{\"type\":\"text\",\"text\":\"".utf8)
     // Block keys are not written in a fixed order (`tool_use_id` usually precedes `type`), so match the type alone.
     private static let toolResultMarker = Array("\"type\":\"tool_result\"".utf8)
+    /// Claude Code writes one content block per line, so a call's name sits in the line's prefix.
+    private static let structuredOutputMarker = Array("\"name\":\"StructuredOutput\"".utf8)
     private static let customTitleLine = Array("{\"type\":\"custom-title\"".utf8)
     private static let customTitleKey = Array("\"customTitle\":\"".utf8)
     private static let aiTitleLine = Array("{\"type\":\"ai-title\"".utf8)
@@ -138,8 +140,10 @@ public enum FastTranscriptParser {
         var isPrompt = false
         if role == .user, find(toolResultMarker, in: head) == nil {
             text = value(after: contentStringKey, in: line, keyIn: head) ?? value(after: contentTextKey, in: line, keyIn: head)
-            // Command output, attachments and compaction summaries are user lines flagged after their content.
+            // Command output, attachments and compaction summaries are user lines flagged after their content; a slash
+            // command the client runs itself is known by its tags.
             isPrompt = find(metaMarker, in: line, backwards: true) == nil && find(summaryMarker, in: line, backwards: true) == nil
+                && !ClaudeTranscriptParser.isLocalCommand(text)
         } else if role == .assistant {
             // A visible answer. A thinking or tool-use block is a different type and never matches this key.
             text = value(after: contentTextKey, in: line, keyIn: head, limit: messageLength)
@@ -166,7 +170,8 @@ public enum FastTranscriptParser {
             isSidechain: find(sidechainMarker, in: head) != nil,
             isPrompt: isPrompt,
             isCompaction: role == .other && find(compactionMarker, in: head) != nil,
-            entrypoint: entrypoint
+            entrypoint: entrypoint,
+            returnsStructuredOutput: role == .assistant && find(structuredOutputMarker, in: head) != nil
         )
     }
 

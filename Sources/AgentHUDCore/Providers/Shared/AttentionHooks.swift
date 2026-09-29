@@ -106,20 +106,22 @@ public enum AttentionHooks {
     }
 
     /// Adds or removes Agent HUD's handler, leaving every other hook in the file alone. An unrecognized layout throws
-    /// rather than being rewritten.
+    /// rather than being rewritten. Either way a handler whose installation is gone goes too, and one another
+    /// installation still answers stays with it (`HookCommand`), which makes adding throw unless `replacingExisting`.
     public static func configure(_ source: Source, enabled: Bool, executable: URL,
                                  home: URL = FileManager.default.homeDirectoryForCurrentUser,
                                  replacingExisting: Bool = false) throws {
         // Taking a handler out never leaves behind a file the client did not have.
         guard enabled || FileManager.default.fileExists(atPath: source.configuration(home: home).path) else { return }
         let object = try configuration(source, home: home)
-        let quoted = "'" + executable.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        let command = quoted + " --attention-hook " + source.rawValue
-        if !replacingExisting && commands(in: object, source: source).contains(where: { $0 != command }) {
-            throw UsageProviderError(L10n.text("通知回调由另一安装管理，请手动重新安装以切换",
-                                               "The notification hook belongs to another installation; reinstall it explicitly to switch"))
+        let command = HookCommand.make(executable: executable, arguments: "--attention-hook " + source.rawValue)
+        let others = replacingExisting ? [] : HookCommand.otherInstallations(commands(in: object, source: source), besides: command)
+        if enabled {
+            try HookCommand.checkInstall(executable: executable, others: others,
+                                         conflict: L10n.text("通知回调由另一安装管理，在该安装中关闭客户端回调后即可切换",
+                                                             "The notification hook belongs to another installation; turn Client hooks off there to switch"))
         }
-        let updated = try updating(object, source: source, command: enabled ? command : nil)
+        let updated = try updating(object, source: source, command: enabled ? command : nil, keeping: others)
         guard updated != object else { return }
         let url = source.configuration(home: home)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -130,14 +132,20 @@ public enum AttentionHooks {
         try encoder.encode(ProviderJSON.object(updated)).write(to: url, options: .atomic)
     }
 
-    static func updating(_ configuration: [String: ProviderJSON], source: Source, command: String?) throws -> [String: ProviderJSON] {
+    /// The configuration with Agent HUD's handlers taken out, except those whose commands are in `keeping`, and
+    /// `command` added when it is given.
+    static func updating(_ configuration: [String: ProviderJSON], source: Source, command: String?,
+                         keeping: Set<String> = []) throws -> [String: ProviderJSON] {
         var object = configuration
         guard object["hooks"] == nil || object["hooks"]?.objectValue != nil else { throw ProviderFailure.format }
         var hooks = object["hooks"]?.objectValue ?? [:]
         guard hooks[source.event] == nil || hooks[source.event]?.arrayValue != nil else { throw ProviderFailure.format }
         var groups = (hooks[source.event]?.arrayValue ?? []).compactMap { group -> ProviderJSON? in
             guard var fields = group.objectValue, let handlers = fields["hooks"]?.arrayValue else { return group }
-            let kept = handlers.filter { !ownsCommand($0["command"].stringValue, source: source) }
+            let kept = handlers.filter {
+                let handler = $0["command"].stringValue
+                return !ownsCommand(handler, source: source) || keeping.contains(handler ?? "")
+            }
             if kept.count == handlers.count { return group }
             if kept.isEmpty { return nil }
             fields["hooks"] = .array(kept)
