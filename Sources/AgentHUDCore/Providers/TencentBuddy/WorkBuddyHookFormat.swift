@@ -19,7 +19,8 @@ enum WorkBuddyHookFormat: CompletionHookFormat {
         ClaudeStyleHooks.commands(in: configuration, event: "Stop", source: .workbuddy)
     }
 
-    static func updating(_ configuration: [String: ProviderJSON], command: String?) throws -> [String: ProviderJSON] {
-        try ClaudeStyleHooks.updating(configuration, event: "Stop", source: .workbuddy, command: command)
+    static func updating(_ configuration: [String: ProviderJSON], command: String?,
+                         keeping: Set<String>) throws -> [String: ProviderJSON] {
+        try ClaudeStyleHooks.updating(configuration, event: "Stop", source: .workbuddy, command: command, keeping: keeping)
     }
 }
