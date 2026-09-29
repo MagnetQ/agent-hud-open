@@ -62,6 +62,33 @@ final class PermissionHookTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual((removed["hooks"]?["PermissionRequest"].arrayValue ?? []).count, 1, "the other handler stays")
     }
 
+    func testAHandlerTheUserChangedKeepsTheirChangesAndOnlyItsCommandMoves() throws {
+        let home = try directory(), apps = try directory()
+        let settings = home.appendingPathComponent(".claude/settings.json")
+        try FileManager.default.createDirectory(at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let current = try app("Agent HUD", in: apps.appendingPathComponent("Applications"))
+        // The user narrowed the handler to shell commands and gave it a shorter wait; the app has moved since.
+        let moved = apps.appendingPathComponent("Downloads/Agent HUD.app/Contents/MacOS/Agent HUD").path
+        try JSONSerialization.data(withJSONObject: ["hooks": ["PermissionRequest": [
+            ["matcher": "Bash", "hooks": [["type": "command", "command": "'\(moved)' --permission-hook claude", "timeout": 600,
+                                           "statusMessage": "Asking the HUD"]]],
+            ["hooks": [["type": "command", "command": "say hi"]]]]]]).write(to: settings)
+
+        try PermissionHooks.configure(.claude, enabled: true, executable: current, home: home)
+        let groups = try ProviderJSON.read(Data(contentsOf: settings))["hooks"]["PermissionRequest"].arrayValue ?? []
+        XCTAssertEqual(groups.count, 2, "the handler stays where it was")
+        XCTAssertEqual(groups.first?["matcher"].stringValue, "Bash")
+        let handler = groups.first?["hooks"].arrayValue?.first
+        XCTAssertEqual(handler?["command"].stringValue, "'\(current.path)' --permission-hook claude")
+        XCTAssertEqual(handler?["timeout"].numberValue, 600)
+        XCTAssertEqual(handler?["statusMessage"].stringValue, "Asking the HUD")
+
+        let file = try FileManager.default.attributesOfItem(atPath: settings.path)[.systemFileNumber] as? Int
+        try PermissionHooks.configure(.claude, enabled: true, executable: current, home: home)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: settings.path)[.systemFileNumber] as? Int, file,
+                       "a start that changes nothing writes nothing")
+    }
+
     func testEachForkIsFoundInItsOwnHome() throws {
         let home = try directory()
         for source in PermissionHooks.Source.allCases {
@@ -177,6 +204,24 @@ final class PermissionHookTests: XCTestCase, @unchecked Sendable {
         }
         XCTAssertEqual(PermissionHooks.Source.codex.configuration(home: home),
                        CodexLocator.dataDirectory(home: home).appendingPathComponent("hooks.json"))
+    }
+
+    func testClaudeAndAntigravityHooksFollowTheDirectoriesTheirReadersFollow() throws {
+        let home = try directory()
+        let claude = home.appendingPathComponent("claude-config", isDirectory: true), gemini = home.appendingPathComponent("gemini", isDirectory: true)
+        XCTAssertEqual(ClaudeSubscription.directory(home: home, environment: ["CLAUDE_CONFIG_DIR": claude.path]), claude)
+        XCTAssertEqual(AntigravitySessions.home(home, environment: ["GEMINI_CLI_HOME": gemini.path]), gemini)
+        XCTAssertEqual(AntigravitySessions.roots(home: home, environment: ["GEMINI_CLI_HOME": gemini.path]).first,
+                       gemini.appendingPathComponent("antigravity-cli/conversations"))
+        for environment in [[:], ["CLAUDE_CONFIG_DIR": "", "GEMINI_CLI_HOME": ""]] {
+            XCTAssertEqual(ClaudeSubscription.directory(home: home, environment: environment), home.appendingPathComponent(".claude", isDirectory: true))
+            XCTAssertEqual(AntigravitySessions.home(home, environment: environment), home.appendingPathComponent(".gemini", isDirectory: true))
+        }
+        let settings = ClaudeSubscription.directory(home: home).appendingPathComponent("settings.json")
+        XCTAssertEqual(AttentionHooks.Source.claude.configuration(home: home), settings)
+        XCTAssertEqual(PermissionHooks.Source.claude.configuration(home: home), settings)
+        XCTAssertEqual(CompletionHooks.Source.antigravity.configuration(home: home),
+                       AntigravitySessions.home(home).appendingPathComponent("config/hooks.json"))
     }
 
     func testCodexPatchAndShellRequestsShowTheOperationAndOnlySupportedAnswers() throws {
@@ -578,6 +623,28 @@ final class PermissionHookTests: XCTestCase, @unchecked Sendable {
         try await waitForPending(0, "the new wait applies to a request already waiting")
         XCTAssertEqual(recv(waiting, &buffer, buffer.count, 0), 0)
         close(waiting)
+    }
+
+    @MainActor
+    func testAnotherInstanceLeavesTheChannelToTheOneServingIt() async throws {
+        let path = try directory().appendingPathComponent("permission.sock").path
+        let requests = PermissionRequests.shared
+        addTeardownBlock { Task { @MainActor in requests.stop() } }
+        // Another process serves the channel: it holds the lock and its socket is at the path.
+        let other = open(path + ".lock", O_CREAT | O_RDWR, 0o600)
+        XCTAssertEqual(flock(other, LOCK_EX | LOCK_NB), 0)
+        try Data().write(to: URL(fileURLWithPath: path))
+        requests.start(path: path)
+        requests.stop()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path), "a second instance neither replaces nor removes the socket")
+
+        close(other)
+        requests.start(path: path)
+        let client = try await ask(path, payload())
+        try await waitForPending(1, "once the first is gone, the channel is this one's")
+        close(client)
+        requests.stop()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path), "and it removes the socket it made")
     }
 
     @MainActor

@@ -35,14 +35,16 @@ public struct ClaudeCodeProvider: UsageProvider, LedgerRecording {
         self.clock = clock
     }
 
-    /// Production wiring: the engine binary if present, plus the usage ledger.
-    public static func standard(ledger: UsageLedger) -> ClaudeCodeProvider {
+    /// Production wiring: the engine binary if present, plus the usage ledger. `persistent` false imports no earlier
+    /// version's quota history.
+    public static func standard(ledger: UsageLedger, persistent: Bool = true) -> ClaudeCodeProvider {
         ClaudeCodeProvider(
             engine: ClaudeEngineLocator.find().map {
                 ClaudeEngineUsageClient(executable: $0, workingDirectory: ClaudeEngineUsageClient.defaultWorkingDirectory)
             },
             transcripts: ClaudeTranscriptStore(ledger: ledger, watchesChanges: true),
-            history: QuotaHistoryStore(ledger: ledger, scope: "claude", importing: AppSupport.directory.appendingPathComponent("quota-history.json")),
+            history: QuotaHistoryStore(ledger: ledger, scope: "claude",
+                                       importing: persistent ? AppSupport.directory.appendingPathComponent("quota-history.json") : nil),
             accountProfileURL: ClaudeSubscription.accountProfileURL,
             home: ClaudeSubscription.home
         )
@@ -87,7 +89,6 @@ public struct ClaudeCodeProvider: UsageProvider, LedgerRecording {
         let consumers = ClaudeModelDiscovery.discover(observations).map(\.descriptor)
 
         // 1. Quota from the engine. A login without plan limits (API key, third-party platform) keeps the local data.
-        var subscription: String?
         var usage: ClaudeUsage?
         var notice: String?
         var updatedAt = now
@@ -95,7 +96,6 @@ public struct ClaudeCodeProvider: UsageProvider, LedgerRecording {
         do {
             if let (result, fetchedAt) = try await engineCache.reading() {
                 reading = result
-                subscription = result.usage.subscriptionType
                 updatedAt = fetchedAt
                 if result.usage.rateLimitsAvailable {
                     // Keep the engine's observation intact. A deadline passing is not a confirmed reset.
@@ -111,7 +111,7 @@ public struct ClaudeCodeProvider: UsageProvider, LedgerRecording {
             guard !sessions.isEmpty else { throw error }
             notice = error.localizedDescription
         }
-        let plan = ClaudeSubscription.plan(type: subscription, profileData: reading?.profileData)
+        let plan = reading?.plan
         let account = reading.map(account(for:))
         let sessionRowId = account?.windowID(ClaudeUsage.sessionRowId) ?? ClaudeUsage.sessionRowId
 
@@ -218,7 +218,7 @@ public struct ClaudeCodeProvider: UsageProvider, LedgerRecording {
             sourceNotices: notice.map { ["Claude": $0] } ?? [:],
             consumerIdsByQuota: consumerIdsByQuota,
             completions: sessions.flatMap(\.completions),
-            turns: Self.awaiting(candidates.compactMap { Self.turn(of: $0, agentsWorkingAt: agents[$0.path]) }, now: now),
+            turns: Self.turns(candidates, agentsWorkingAt: agents, requests: AttentionHooks.read(source: AttentionHooks.Source.claude, now: now)),
             // A login without plan limits has no current subscription account; earlier accounts keep their last readings.
             accounts: reading.map { reading in
                 ["Claude": usage == nil ? [] : [AccountObservation(account: self.account(for: reading), home: home,
@@ -230,11 +230,12 @@ public struct ClaudeCodeProvider: UsageProvider, LedgerRecording {
 
 /// Serialises engine queries and throttles them, since each one spawns a full engine process.
 actor EngineUsageCache {
-    /// One engine reading with the account profile read around it.
+    /// One engine reading with what the account profile read around it says. The profile can run to megabytes, so
+    /// it is decoded once for the reading rather than on every pass that shows it.
     struct Reading: Sendable {
         let usage: ClaudeEngineUsage
         let identity: ClaudeSubscription.Identity?
-        let profileData: Data?
+        let plan: String?
         /// Asked only when there are no plan limits, to say why there are none.
         var signedIn: Bool?
     }
@@ -263,7 +264,8 @@ actor EngineUsageCache {
             // An API-key or third-party login can leave an old profile behind; only plan limits make it the reading's account.
             guard ClaudeSubscription.identity(profileData: before) == identity else { throw ClaudeDataError.accountChanged }
             let signedIn = usage.rateLimitsAvailable ? nil : await client.isSignedIn()
-            result = .success(Reading(usage: usage, identity: usage.rateLimitsAvailable ? identity : nil, profileData: after,
+            result = .success(Reading(usage: usage, identity: usage.rateLimitsAvailable ? identity : nil,
+                                      plan: ClaudeSubscription.plan(type: usage.subscriptionType, profileData: after),
                                       signedIn: signedIn))
         }
         catch {
@@ -289,21 +291,27 @@ extension ClaudeCodeProvider {
         return latest
     }
 
+    /// Each session's turn. A request is compared with the session's own log, which is what answering it writes to; what
+    /// its sub-agents write afterwards does not answer it, so their work is added only once that is decided.
+    static func turns(_ sessions: [TranscriptSession], agentsWorkingAt: [String: Date],
+                      requests: [String: AttentionHooks.Event]) -> [SessionTurn] {
+        sessions.compactMap { session in
+            session.turn.map { turn(awaiting([$0], requests: requests)[0], agentsWorkingAt: agentsWorkingAt[session.path]) }
+        }
+    }
+
     /// The session's turn, running while its agents work: the agent that stopped, or went quiet waiting for them, has not
-    /// finished what it was asked.
-    static func turn(of session: TranscriptSession, agentsWorkingAt: Date?) -> SessionTurn? {
-        guard let turn = session.turn, let agentsWorkingAt else { return session.turn }
-        return SessionTurn(provider: turn.provider, sessionID: turn.sessionID, turnID: turn.turnID, state: .running,
-                           startedAtMs: turn.startedAtMs,
+    /// finished what it was asked. A turn waiting for approval keeps waiting.
+    static func turn(_ turn: SessionTurn, agentsWorkingAt: Date?) -> SessionTurn {
+        guard let agentsWorkingAt else { return turn }
+        return SessionTurn(provider: turn.provider, sessionID: turn.sessionID, turnID: turn.turnID,
+                           state: turn.state == .waitingForApproval ? .waitingForApproval : .running, startedAtMs: turn.startedAtMs,
                            observedAtMs: max(turn.observedAtMs, RecordCoding.milliseconds(agentsWorkingAt)), message: turn.message)
     }
 
     /// A turn Claude Code said it is blocked on. The hook only says it needs the user; a turn that is still running is
     /// waiting for approval, and one that already finished is simply waiting for the next prompt. A request older than
     /// the transcript has been answered.
-    static func awaiting(_ turns: [SessionTurn], now: Date) -> [SessionTurn] {
-        awaiting(turns, requests: AttentionHooks.read(source: AttentionHooks.Source.claude, now: now))
-    }
 
     static func awaiting(_ turns: [SessionTurn], requests: [String: AttentionHooks.Event]) -> [SessionTurn] {
         guard !requests.isEmpty else { return turns }

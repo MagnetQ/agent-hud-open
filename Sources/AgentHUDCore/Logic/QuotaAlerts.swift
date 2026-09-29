@@ -48,6 +48,9 @@ public struct QuotaAlertTracker: Sendable {
         let atRisk: Bool
         let critical: Bool
         let exhausted: Bool
+        /// The reset of the cycle a forecast already warned in. The estimate moves with every reading, so it warns once
+        /// per cycle, not whenever it dips below the reset and back.
+        var forecastWarnedUntil: Date? = nil
     }
     private var previous: [String: Observation] = [:]
 
@@ -78,7 +81,9 @@ public struct QuotaAlertTracker: Sendable {
             let critical = snapshot.remainingPct <= criticalThreshold
             let exhausted = snapshot.remainingPct <= 0
             let atRisk = exhausted || critical || predictsCap
-            previous[agent.id] = Observation(snapshot: snapshot, atRisk: atRisk, critical: critical, exhausted: exhausted)
+            let warnedUntil = old?.forecastWarnedUntil.flatMap { $0 > snapshot.updatedAt ? $0 : nil }
+            previous[agent.id] = Observation(snapshot: snapshot, atRisk: atRisk, critical: critical, exhausted: exhausted,
+                                             forecastWarnedUntil: warnedUntil)
             guard let old else { continue } // First observation establishes a baseline without notifying.
 
             if critical && !old.critical { result.criticalAgentIDs.insert(agent.id) }
@@ -86,8 +91,9 @@ public struct QuotaAlertTracker: Sendable {
             let cycleAdvanced = old.snapshot.resetAt.map { oldReset in
                 snapshot.resetAt.map { $0 > oldReset && snapshot.updatedAt >= oldReset } == true
             } ?? false
-            // An early/manual reset may retain the deadline but restores the full window.
-            let restoredEarly = snapshot.remainingPct == 100 && old.snapshot.remainingPct < 100
+            // An early/manual reset may retain the deadline but restores the full window; a reading that wobbles up to
+            // full by a point or two is not one.
+            let restoredEarly = snapshot.remainingPct == 100 && snapshot.remainingPct - old.snapshot.remainingPct >= UsageAnalytics.resetRise
             if cycleAdvanced || restoredEarly {
                 let otherExhausted = quotaAgents.filter {
                     $0.vendor == agent.vendor && $0.account?.id == agent.account?.id && $0.id != agent.id &&
@@ -97,9 +103,10 @@ public struct QuotaAlertTracker: Sendable {
             } else if exhausted && !old.exhausted {
                 // Running out is its own event even after the earlier at-risk warning.
                 result.alerts.append(QuotaAlert(kind: .exhaustion, agent: agent, snapshot: snapshot))
-            } else if atRisk && !old.atRisk {
+            } else if atRisk && !old.atRisk && (critical || warnedUntil == nil) {
                 result.alerts.append(QuotaAlert(kind: .exhaustion, agent: agent, snapshot: snapshot,
                                                timeToExhaust: predictsCap ? forecast : nil))
+                if !critical { previous[agent.id]?.forecastWarnedUntil = snapshot.resetAt }
             }
         }
         return result

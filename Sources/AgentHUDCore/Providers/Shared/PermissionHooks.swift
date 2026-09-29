@@ -105,13 +105,7 @@ public enum PermissionHooks {
             if case .codebuddy = self { return CodeBuddySessions.home(base) }
             if case .qwen = self { return QwenSessions.home(base) }
             // Claude Code's configuration directory moves with CLAUDE_CONFIG_DIR; the forks have no such variable.
-            if case .claude = self, let configured = ClaudeSubscription.configDirectory { return configured }
-            // OpenCode keeps its configuration under XDG_CONFIG_HOME/opencode (defaulting to ~/.config).
-            if case .opencode = self {
-                let env = ProcessInfo.processInfo.environment
-                let root = URL(fileURLWithPath: env["XDG_CONFIG_HOME"] ?? base.appendingPathComponent(".config").path)
-                return root.appendingPathComponent("opencode", isDirectory: true)
-            }
+            if case .claude = self { return ClaudeSubscription.directory(home: base) }
             return base.appendingPathComponent(directory, isDirectory: true)
         }
 
@@ -133,7 +127,7 @@ public enum PermissionHooks {
             switch self {
             case .claude:
                 return ClaudeEngineLocator.find(home: home, fileManager: fileManager) != nil
-                    || fileManager.fileExists(atPath: home.appendingPathComponent(".claude/projects").path)
+                    || fileManager.fileExists(atPath: self.home(home).appendingPathComponent("projects").path)
             case .codex, .qoder, .qoderCN, .qoderWork, .zcode, .qwen:
                 return fileManager.fileExists(atPath: self.home(home).path)
             // The session folder is what the usage provider reads; a settings folder alone can be the IDE extension's.
@@ -197,17 +191,11 @@ public enum PermissionHooks {
         }
         let updated = try updating(object, source: source, command: enabled ? command : nil, keeping: others)
         guard updated != object else { return }
-        let url = source.configuration(home: home)
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        // A configuration file can hold server credentials; the rewrite keeps whatever access the client gave it.
-        let permissions = try? FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions]
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        try encoder.encode(ProviderJSON.object(updated)).write(to: url, options: .atomic)
-        if let permissions { try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path) }
+        try HookSettings.write(updated, to: source.configuration(home: home))
     }
 
-    /// The configuration with Agent HUD's handlers taken out, except those whose commands are in `keeping`, and
-    /// `command` added when it is given.
+    /// The configuration with Agent HUD's handlers taken out, except those whose commands are in `keeping`, or with
+    /// `command` when it is given: in the handler already there, or in a group of its own.
     static func updating(_ configuration: [String: ProviderJSON], source: Source, command: String?,
                          keeping: Set<String> = []) throws -> [String: ProviderJSON] {
         var object = configuration
@@ -220,22 +208,13 @@ public enum PermissionHooks {
         }
         var events = source.nestsEvents ? hooks["events"]?.objectValue ?? [:] : hooks
         guard events[source.event] == nil || events[source.event]?.arrayValue != nil else { throw ProviderFailure.format }
-        var groups = (events[source.event]?.arrayValue ?? []).compactMap { group -> ProviderJSON? in
-            guard var fields = group.objectValue, let handlers = fields["hooks"]?.arrayValue else { return group }
-            let kept = handlers.filter {
-                let handler = $0["command"].stringValue
-                return !ownsCommand(handler, source: source) || keeping.contains(handler ?? "")
-            }
-            if kept.count == handlers.count { return group }
-            if kept.isEmpty { return nil }
-            fields["hooks"] = .array(kept)
-            return .object(fields)
-        }
-        if let command {
+        // A handler already there takes the new command and keeps the matcher, timeout and anything else the user set.
+        let groups = ClaudeStyleHooks.setting(command, in: events[source.event]?.arrayValue ?? [], keeping: keeping,
+                                              owns: { ownsCommand($0, source: source) }) { command in
             var group: [String: ProviderJSON] = ["hooks": .array([.object(["type": .string("command"), "command": .string(command),
                                                                            "timeout": .integer(Int64(source.timeout))])])]
             if let matcher = source.matcher { group["matcher"] = .string(matcher) }
-            groups.append(.object(group))
+            return .object(group)
         }
         events[source.event] = groups.isEmpty ? nil : .array(groups)
         if source.nestsEvents {

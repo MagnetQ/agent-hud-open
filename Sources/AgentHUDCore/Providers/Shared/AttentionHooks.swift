@@ -11,14 +11,15 @@ public enum AttentionHooks {
         /// The notification types worth waking for. Claude Code filters on the type itself, so nothing here depends on
         /// the wording of a message, and a sign-in or quota notice never looks like a request for the user.
         var matcher: String { "permission_prompt|agent_needs_input" }
-        func configuration(home: URL) -> URL { home.appendingPathComponent(".claude/settings.json") }
+        /// Claude Code's settings, in the directory `CLAUDE_CONFIG_DIR` moves.
+        func configuration(home: URL) -> URL { ClaudeSubscription.directory(home: home).appendingPathComponent("settings.json") }
 
         /// Whether the client is here at all. A machine without it keeps its home untouched.
         func isInstalled(home: URL = FileManager.default.homeDirectoryForCurrentUser, fileManager: FileManager = .default) -> Bool {
             switch self {
             case .claude:
                 return ClaudeEngineLocator.find(home: home, fileManager: fileManager) != nil
-                    || fileManager.fileExists(atPath: home.appendingPathComponent(".claude/projects").path)
+                    || fileManager.fileExists(atPath: ClaudeSubscription.directory(home: home).appendingPathComponent("projects").path)
             }
         }
     }
@@ -123,37 +124,25 @@ public enum AttentionHooks {
         }
         let updated = try updating(object, source: source, command: enabled ? command : nil, keeping: others)
         guard updated != object else { return }
-        let url = source.configuration(home: home)
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         // The inbox exists from the moment the hook does, so its changes can be watched before the first request.
         try? FileManager.default.createDirectory(at: directory.appendingPathComponent(source.rawValue),
                                                  withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        try encoder.encode(ProviderJSON.object(updated)).write(to: url, options: .atomic)
+        try HookSettings.write(updated, to: source.configuration(home: home))
     }
 
-    /// The configuration with Agent HUD's handlers taken out, except those whose commands are in `keeping`, and
-    /// `command` added when it is given.
+    /// The configuration with Agent HUD's handlers taken out, except those whose commands are in `keeping`, or with
+    /// `command` when it is given: in the handler already there, or in a group of its own.
     static func updating(_ configuration: [String: ProviderJSON], source: Source, command: String?,
                          keeping: Set<String> = []) throws -> [String: ProviderJSON] {
         var object = configuration
         guard object["hooks"] == nil || object["hooks"]?.objectValue != nil else { throw ProviderFailure.format }
         var hooks = object["hooks"]?.objectValue ?? [:]
         guard hooks[source.event] == nil || hooks[source.event]?.arrayValue != nil else { throw ProviderFailure.format }
-        var groups = (hooks[source.event]?.arrayValue ?? []).compactMap { group -> ProviderJSON? in
-            guard var fields = group.objectValue, let handlers = fields["hooks"]?.arrayValue else { return group }
-            let kept = handlers.filter {
-                let handler = $0["command"].stringValue
-                return !ownsCommand(handler, source: source) || keeping.contains(handler ?? "")
-            }
-            if kept.count == handlers.count { return group }
-            if kept.isEmpty { return nil }
-            fields["hooks"] = .array(kept)
-            return .object(fields)
-        }
-        if let command {
-            groups.append(.object(["matcher": .string(source.matcher),
-                                   "hooks": .array([.object(["type": .string("command"), "command": .string(command), "timeout": .integer(5)])])]))
+        // A handler already there takes the new command and keeps the matcher, timeout and anything else the user set.
+        let groups = ClaudeStyleHooks.setting(command, in: hooks[source.event]?.arrayValue ?? [], keeping: keeping,
+                                              owns: { ownsCommand($0, source: source) }) { command in
+            .object(["matcher": .string(source.matcher),
+                     "hooks": .array([.object(["type": .string("command"), "command": .string(command), "timeout": .integer(5)])])])
         }
         hooks[source.event] = groups.isEmpty ? nil : .array(groups)
         object["hooks"] = hooks.isEmpty && configuration["hooks"] == nil ? nil : .object(hooks)

@@ -49,7 +49,7 @@ The five kinds (`TokenKind`, selected as `TokenDimensions`) are additive and nev
 
 - The policy is fixed (`AlertPolicy`): nothing is stored, synchronized or configurable. A color describes the resource state of one reading; readings of different windows are never combined into one health score, and a color never indicates task progress.
 - The glow shows one segment per enabled window that has a reading; windows without a reading stay out of it, and a paused or hidden glow is grey.
-- Alerts (`QuotaAlertTracker`): the first reading of a window is a silent baseline; crossing 90% used, reaching zero, a forecast of exhaustion before the reset, and a confirmed reset each notify once. Readings older than 30 minutes stay visible but generate no alerts.
+- Alerts (`QuotaAlertTracker`): the first reading of a window is a silent baseline; crossing 90% used, reaching zero, a forecast of exhaustion before the reset, and a confirmed reset each notify once. A forecast notifies once per cycle, however often the estimate dips below the reset and back. Readings older than 30 minutes stay visible but generate no alerts.
 - A window whose quota reading failed or could not be verified keeps its last reading on screen but has no level, stays out of the glow and raises no alert until a reading succeeds; a notice about the client's local logs or completion hooks is shown as well and holds back none of these.
 - Added usage resets (`ResetCreditTracker`): a rise in a signed-in account's Codex reset-credit count notifies once, with how many were added; the first reading of an account is a silent baseline, and using a credit or letting one expire is not an event. A reading with a notice or older than 30 minutes confirms nothing.
 - The burn rate (`UsageAnalytics.burnRate`) is the recent pace with idle time included: consumption over the last hour of a 5h window, the last day of a weekly one and the last week of a monthly one, or over the whole observed series while that is shorter. A rise under 5 points is reading noise; a larger one is a reset and restarts the series. A series shorter than 15 minutes, or one hour for windows of a day or more, gives no estimate.
@@ -71,7 +71,7 @@ Reads never run in parallel: the usage store runs one pass of source reads or on
 
 | Work | Cadence |
 | --- | --- |
-| One client's local logs | When a file under its data directories changes, when one of its live sessions reaches 120 s or a running turn 120 s or 5 minutes without an observation, and after its account step; passes start at most every 2 s |
+| One client's local logs | When a file under its data directories changes, when one of its live sessions reaches 120 s or a running turn 120 s, 5 minutes or 30 minutes without an observation, and after its account step; passes start at most every 2 s |
 | Local logs of a source that cannot name its directories | Every 5 s |
 | Every client's local logs while the first index is being built | Every 2 s |
 | Account readings: Claude Code engine `get_usage`, Codex `account/rateLimits/read`, DeepSeek balance, Antigravity, Cursor, Grok and GitHub Copilot quota, Cursor account usage events, and Kimi, GLM and OpenCode Go quota per billing pool | Per client: every minute while one of its turns runs, every 3 minutes while a session of its is live between turns, once more for work that finished since its last reading, and when one of its windows resets. Also when the panel, the menu bar menu or the statistics window opens, and at once when GitHub Copilot quota reading is switched on or off |
@@ -79,18 +79,18 @@ Reads never run in parallel: the usage store runs one pass of source reads or on
 - A client nobody is using is not asked: its windows move only while its own work runs. A window whose reset has passed, a reading that names no window, and a client whose usage is the account's from every device it signs in on (Cursor and Codex, including Pi logins) keep the 5-minute interval.
 - A known reset takes priority over the normal cadence and stays due until an account request has run at or after it, subject to the 60-second request spacing. An old window returned after that attempt retries on the normal cadence.
 - Account steps run one provider after another, back to back for at most one second before local logs get their turn, so a slow request delays a poll by that request alone.
-- A pass reads only the clients that signalled; the others keep their last result. Every local source is read again every 5 minutes, which catches a change a directory watch missed. Claude Code and Codex polls examine only the logs the watch reported changed, and list every log again every 5 minutes or after dropped events.
+- A pass reads only the clients that signalled; the others keep their last result. Every local source is read again every 5 minutes, which catches a change a directory watch missed. Every client's listing of its logs and databases examines only the files the watch reported changed, and lists every file again every 5 minutes or after dropped events; a listing that stops at its limit keeps the files it did not reach that are still there.
 - A provider never repeats an account request within 60 s, whoever asks, and a failure waits as long as a success; it is reported as a source notice while the other sources keep working.
 
 ### Reading retention
 
 - The last successful reading is kept with its observation time; a failed refresh keeps it and exposes the failure, and a restart restores it before the first poll.
 - A client whose read, or whose quota or balance reading, failed keeps the sessions it last reported beside those it still reports; a notice about its local logs or hooks keeps none.
-- When a window's reset time has passed, the row keeps the last reading and its time. A reset is confirmed only by a new reading whose reset time moved forward or that shows the window full again; until then alert evaluation treats the deadline as pending and the row displays “Pending update”. Historical accounts show no live countdown. A successful Codex response replaces that account's complete window inventory, removing omitted windows; failures retain the old inventory.
+- When a window's reset time has passed, the row keeps the last reading and its time. A reset is confirmed only by a new reading whose reset time moved forward or that shows the window full again after rising at least 5 points; until then alert evaluation treats the deadline as pending and the row displays “Pending update”. Historical accounts show no live countdown. A successful Codex response replaces that account's complete window inventory, removing omitted windows; failures retain the old inventory.
 - Kimi, GLM and OpenCode Go rows are retired — readings, cached rows and display settings — once a completed credential scan finds their credentials expired, removed or rejected; a temporary network failure retires nothing.
 - A row no provider has reported for 30 days retires with its reading, whatever stopped it: a client uninstalled, a window the service dropped, a vendor no longer read. Until a provider reports a row it is not shown anywhere, and its stored display switch and position wait for it.
 - Quota histories keep 30 days.
-- A running session leaves the running indicator 120 s after its last source observation and stays in history without an invented end time.
+- A session whose source never says what its turn is doing leaves the running indicator 120 s after its last observation; one whose source reports a running turn keeps it until the turn ends, or until 30 minutes without an observation say its client is gone. Either way it stays in history without an invented end time.
 
 ## Code map
 

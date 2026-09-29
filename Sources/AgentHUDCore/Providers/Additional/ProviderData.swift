@@ -129,6 +129,8 @@ struct ProviderSessions: Sendable {
     var revision: Int? = nil
     /// The files the sessions come from; nil for a reader of account records.
     var files: ListedFiles? = nil
+    /// Where the reader's history starts, when it starts later than asked.
+    var start: Date? = nil
 }
 
 // The existing JSON value representation keeps parsed data Sendable without passing Foundation Any graphs.
@@ -159,7 +161,7 @@ extension JSONValue {
         guard let count = countValue else { throw ProviderFailure.format }
         return count
     }
-    static func read(_ data: Data) throws -> Self { try JSONDecoder().decode(Self.self, from: data) }
+    static func read(_ data: Data) throws -> Self { try parse(data) }
 }
 
 enum ProviderDate {

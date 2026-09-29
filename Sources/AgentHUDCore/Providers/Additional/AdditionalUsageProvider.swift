@@ -5,6 +5,7 @@ actor AdditionalUsageProvider: UsageProvider, LedgerRecording {
     let source: AdditionalSource
     private let readQuota: @Sendable () async throws -> ProviderQuota
     private let readSessions: @Sendable (Date) async -> ProviderSessions
+    private let noteChanges: @Sendable (Set<String>?) async -> Void
     private let refreshSessions: @Sendable (Int) async -> Void
     private let readCompletions: @Sendable (Date) throws -> [SessionCompletion]
     private let history: QuotaHistoryStore
@@ -12,6 +13,9 @@ actor AdditionalUsageProvider: UsageProvider, LedgerRecording {
     /// A change of this value (such as a consent toggle) refreshes quota without waiting for the interval.
     private let quotaKey: @Sendable () -> String
     private var lastQuota: (at: Date, key: String, result: Result<ProviderQuota, UsageProviderError>)?
+    /// The account the last reading that succeeded resolved, which a failed reading keeps: usage kept per account must
+    /// not move to another key and back whenever a quota request fails.
+    private var lastAccount: ProviderAccount?
     nonisolated let watchedDirectories: [URL]?
     /// Cursor's usage is the account's, from every device it signs in on, so this Mac going quiet says nothing about it.
     nonisolated var seesLocalWork: Bool { source != .cursor }
@@ -25,8 +29,10 @@ actor AdditionalUsageProvider: UsageProvider, LedgerRecording {
          clock: @escaping @Sendable () -> Date = { Date() },
          quotaKey: @escaping @Sendable () -> String = { "" },
          refreshSessions: @escaping @Sendable (Int) async -> Void = { _ in },
-         watchedDirectories: [URL]? = nil, ledger: UsageLedger = .inMemory()) {
+         watchedDirectories: [URL]? = nil, fileChanges: @escaping @Sendable (Set<String>?) async -> Void = { _ in },
+         ledger: UsageLedger = .inMemory()) {
         self.source = source; self.readQuota = readQuota; self.readSessions = readSessions
+        noteChanges = fileChanges
         self.readCompletions = readCompletions
         self.refreshSessions = refreshSessions
         self.history = history; self.clock = clock; self.quotaKey = quotaKey
@@ -60,8 +66,10 @@ actor AdditionalUsageProvider: UsageProvider, LedgerRecording {
             }
         }, watchedDirectories: local.roots + (CompletionHooks.Source(rawValue: source.rawValue).map {
             [CompletionHooks.directory.appendingPathComponent($0.rawValue)]
-        } ?? []), ledger: ledger)
+        } ?? []), fileChanges: { await local.fileChanges($0) }, ledger: ledger)
     }
+
+    func fileChanges(_ paths: Set<String>?) async { await noteChanges(paths) }
 
     /// This source's 15-minute token totals from the period holding `since`.
     func usage(since: Date) async -> [UsageBucket] {
@@ -71,8 +79,11 @@ actor AdditionalUsageProvider: UsageProvider, LedgerRecording {
     /// Writes each session's usage once the index is complete and something changed.
     private func record(_ local: ProviderSessions, account: String?, since: Date, now: Date) async {
         guard local.indexing == nil else { return }
-        let window = SessionContributions.windowStart(max(since, source.readerWindow.map { now.addingTimeInterval(-$0) } ?? since))
-        await sessionLedger.record(files: local.files, revision: local.revision, account: account, window: window) {
+        // A database reader returns its own last days, and Cursor's dashboard its days from local midnight.
+        let readerStart = local.start ?? source.readerWindow.map { SessionContributions.nextDayStart(now.addingTimeInterval(-$0)) }
+        let window = SessionContributions.windowStart(since, readerStart: readerStart)
+        await sessionLedger.record(files: local.files, revision: local.revision, account: account, window: window,
+                                   runningTotals: source == .hermes, now: now) {
             local.sessions.map { session in (session.id, session.events.map { $0.usage(source: source) }) }
         }
     }
@@ -119,9 +130,13 @@ actor AdditionalUsageProvider: UsageProvider, LedgerRecording {
         case nil: (quota, quotaNotice) = (ProviderQuota(), nil)
         }
         let account = quota.resolvedAccount(source)
+        if quota.forgetAccounts { lastAccount = nil }
+        if quota.isSignedIn { lastAccount = account }
+        let failed = if case .failure = lastQuota?.result { true } else { false }
         let windows = quota.scopedWindows(source)
         // Account-wide imports are the same on every machine signed into the account, so their totals are kept per account.
-        let usageAccount = local.sessions.contains(where: \.accountWide) ? (quota.isSignedIn ? account.id : "provider:" + source.vendor.lowercased()) : nil
+        let usageAccount = local.sessions.contains(where: \.accountWide)
+            ? (quota.isSignedIn ? account.id : (failed ? lastAccount?.id : nil) ?? "provider:" + source.vendor.lowercased()) : nil
         await record(local, account: usageAccount, since: since, now: now)
         let consumers = Set(local.sessions.flatMap(\.events).map(\.model)).sorted().map {
             AgentDescriptor(id: "\(source.rawValue)-model:\($0)", vendor: source.vendor, model: $0,

@@ -63,24 +63,21 @@ struct OpenAgentSession: Sendable {
 
     /// - input, output: including `cacheWrite` and `reasoning`.
     mutating func add(id eventID: String, model: String, provider: String, at: Date, input: Int, output: Int,
-                      cacheRead: Int, cacheWrite: Int = 0, reasoning: Int = 0, estimate: Decimal? = nil) throws {
+                      cacheRead: Int, cacheWrite: Int = 0, reasoning: Int = 0) throws {
         _ = try TokenCount.sum(input, output, cacheRead)
         setModel(model, provider: provider)
         let consumer = currentModel!.id
         events.append(.init(timestamp: at, agentId: consumer, tokensIn: input, tokensOut: output,
             cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite, reasoningTokens: reasoning, eventID: eventID,
-            attribution: .init(client: client.name, providerID: provider, estimatedUSD: estimate)))
+            attribution: .init(client: client.name, providerID: provider)))
         start = min(start ?? at, at); end = max(end ?? at, at)
     }
 }
 
 /// Provider licenses are listed in THIRD_PARTY_NOTICES.txt.
-/// Only metadata and counters leave these parsers; prompts, tool bodies and credentials do not.
+/// Only metadata, counters and session titles (a name, or the first line of the first prompt) leave these parsers;
+/// prompts, tool bodies and credentials do not.
 enum OpenAgentParser {
-    static func decimal(_ value: ProviderJSON) -> Decimal? {
-        guard let number = value.numberValue, number >= 0 else { return nil }
-        return Decimal(string: String(number), locale: Locale(identifier: "en_US_POSIX"))
-    }
     static func jsonLines(_ data: Data, visit: (ProviderJSON, Int) throws -> Void) throws {
         guard data.count <= 64 * 1024 * 1024 else { throw ProviderFailure.limit }
         let lines = data.split(separator: 10, omittingEmptySubsequences: false)
@@ -97,24 +94,29 @@ enum OpenAgentParser {
 
     static func pi(_ data: Data, path: String) throws -> [OpenAgentSession] {
         var session: OpenAgentSession?
+        // Pi's own session list: the name last given with `/name` (an empty one clears it), else the first message.
+        var name: String?, prompt: String?
         try jsonLines(data) { line, index in
             let type = line["type"].stringValue
             if type == "session", let id = line["id"].stringValue {
                 session = .init(id: "pi:\(id)", client: .pi, title: "Pi", workspace: line["cwd"].stringValue, path: path,
                                 start: ProviderDate.iso(line["timestamp"].stringValue))
-                // A stand-in name yields to any name the log or Pi's observer carries.
-                session?.titleSource = .placeholder
+                name = nil; prompt = nil
                 return
             }
             guard session != nil else { return }
-            if type == "session_info", let name = SessionTitle.named(line["name"].stringValue) {
-                session?.title = name; session?.titleSource = .log; return
-            }
+            if type == "session_info" { name = SessionTitle.named(line["name"].stringValue); return }
             if type == "model_change", let model = line["modelId"].stringValue, let provider = line["provider"].stringValue {
                 session?.setModel(model, provider: provider)
                 return
             }
             let message = line["message"]
+            if prompt == nil, type == "message", message["role"].stringValue == "user" {
+                let content = message["content"]
+                let text = content.stringValue ?? content.arrayValue?.first { $0["type"].stringValue == "text" }?["text"].stringValue
+                prompt = text.flatMap(SessionTitle.from)
+                return
+            }
             guard type == "message", message["role"].stringValue == "assistant", message["usage"].objectValue != nil else { return }
             guard let at = ProviderDate.iso(line["timestamp"].stringValue) ?? ProviderDate.milliseconds(message["timestamp"]) else { throw ProviderFailure.format }
             let usage = message["usage"]
@@ -130,9 +132,10 @@ enum OpenAgentParser {
                 identity = "pi:entry:" + RecordCoding.hash([entry, String(RecordCoding.milliseconds(at)), provider, model])
             } else { identity = "\(session!.id):line:\(index)" }
             try session?.add(id: identity, model: model, provider: provider, at: at, input: try TokenCount.sum(input, write),
-                         output: output, cacheRead: read, cacheWrite: write, estimate: decimal(usage["cost"]["total"]))
+                         output: output, cacheRead: read, cacheWrite: write)
             // An assistant stop is not agent_settled; retries, tools and queued followups can still run.
         }
+        if let title = name ?? prompt { session?.title = title } else { session?.titleSource = .placeholder }
         return session.map { [$0] } ?? []
     }
 
@@ -153,13 +156,11 @@ enum OpenAgentParser {
     }
 
     static func kimi(_ data: Data, path: String) throws -> [OpenAgentSession] {
-        let file = URL(fileURLWithPath: path)
-        let (folder, agent, modern) = kimiSession(file)
-        let sessionID = folder.lastPathComponent
-        let named = kimiTitle(folder)
-        var session = OpenAgentSession(id: "kimi:\(sessionID):\(agent)", client: .kimi, title: named ?? "Kimi", path: path)
-        // A stand-in name yields to any name the log or Pi's observer carries.
-        if named == nil { session.titleSource = .placeholder }
+        let (folder, agent, modern) = kimiSession(URL(fileURLWithPath: path))
+        // Sub-agents keep the client's name; the title belongs to the conversation the main agent holds.
+        let title = agent == "main" ? kimiTitle(folder) : nil
+        var session = OpenAgentSession(id: "kimi:\(folder.lastPathComponent):\(agent)", client: .kimi, title: title ?? "Kimi",
+                                       titleSource: title == nil ? .placeholder : .log, path: path)
         var requestModel: String?, keyed: [String: Int] = [:]
         func concrete(_ name: String?) -> String? {
             guard let name, !name.isEmpty, !name.hasPrefix("__") else { return nil }; return name
@@ -227,6 +228,14 @@ enum OpenAgentParser {
         return [session]
     }
 
+    /// OpenCode names a session `New session - <ISO time>` (`Child session - …` for a sub-agent's) until its title agent
+    /// answers the first message, and keeps that name when the title call fails.
+    static func openCodeTitle(_ title: String?) -> String? {
+        guard let title = SessionTitle.named(title),
+              title.range(of: #"^(New|Child) session - \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$"#, options: .regularExpression) == nil else { return nil }
+        return title
+    }
+
     static func openCodeMessage(_ value: ProviderJSON, id: String, sessionID: String, path: String,
                                 title: String? = nil, workspace: String? = nil, assistant: Bool = false) throws -> OpenAgentSession? {
         guard value["role"].stringValue == "assistant" || (assistant && value["role"] == .null) else { return nil }
@@ -237,17 +246,22 @@ enum OpenAgentParser {
         let read = try tokens["cache"]["read"].optionalCounter(), write = try tokens["cache"]["write"].optionalCounter()
         let model = value["modelID"].stringValue ?? value["model"]["id"].stringValue ?? "Unknown"
         let provider = value["providerID"].stringValue ?? value["model"]["providerID"].stringValue ?? "Unknown"
-        var session = OpenAgentSession(id: "opencode:\(sessionID)", client: .opencode, title: title ?? "OpenCode",
-            workspace: workspace ?? value["path"]["root"].stringValue, path: path)
+        let workspace = workspace ?? value["path"]["root"].stringValue, named = openCodeTitle(title)
+        var session = OpenAgentSession(id: "opencode:\(sessionID)", client: .opencode,
+            title: named ?? workspace.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "OpenCode",
+            titleSource: named == nil ? .placeholder : .log, workspace: workspace, path: path)
         try session.add(id: "opencode:\(id)", model: model, provider: provider, at: at,
                     input: try TokenCount.sum(input, write), output: try TokenCount.sum(output, tokens["reasoning"].optionalCounter()), cacheRead: read,
-                    cacheWrite: write, reasoning: try tokens["reasoning"].optionalCounter(), estimate: decimal(value["cost"]))
+                    cacheWrite: write, reasoning: try tokens["reasoning"].optionalCounter())
         session.end = ProviderDate.milliseconds(value["time"]["completed"]) ?? at
         return session
     }
 
-    /// Whether a message table holds at least one assistant record. A table can exist and carry none:
-    /// `session_message` holds platform events alone in the builds that write both stores.
+    /// Replies read from OpenCode's database per statement.
+    static let openCodePage = 5000
+
+    /// Whether a message table holds at least one assistant record. A table can exist and carry none: the builds that
+    /// write both stores keep `session_message` for platform events alone.
     static func hasAssistantRecords(_ db: ReadOnlySQLite, table: String) throws -> Bool {
         let filter = table == "session_message" ? "type = 'assistant'" : "json_extract(data, '$.role') = 'assistant'"
         var found = false
@@ -255,38 +269,55 @@ enum OpenAgentParser {
         return found
     }
 
+    /// Replies are in `message`, and in `session_message` for sessions of OpenCode's newer kind, whose table also holds
+    /// agent and model switches before it holds any reply. The two name one reply by different ids, so a session is read
+    /// from `session_message` once that table has its replies, and from `message` until then. A reply's record can hold
+    /// far more than what it is counted by, so SQLite hands over only those fields, a page of replies at a time.
     static func openCodeSQLite(_ url: URL, since: Date = .distantPast) throws -> [OpenAgentSession] {
         let db = try ReadOnlySQLite(url)
         var tables = Set<String>()
         try db.rows("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('session_message', 'message', 'session_v2', 'session', 'part')") { row in
             if let name = ReadOnlySQLite.text(row, 0) { tables.insert(name) }
         }
+        for table in tables { try db.requireTable(table) }
+        // A current OpenCode keeps `session_message` for platform events alone, so the table's presence no longer means
+        // it holds the conversation: take it only when it has assistant records of its own.
+        var newer = tables.contains("session_message")
+        if newer, tables.contains("message") {
+            newer = try hasAssistantRecords(db, table: "session_message")
+        }
+        guard newer || tables.contains("message") else { throw ProviderFailure.format }
         var sessions: [OpenAgentSession] = []
         // Prefer SQLite records. Stable message IDs deduplicate JSON records.
-        // A current OpenCode keeps `session_message` for platform events only, so the table's
-        // presence no longer means it holds the conversation: take it only when it has assistant records.
-        var message = tables.contains("session_message") ? "session_message" : "message"
-        if tables.contains("message"), tables.contains("session_message"),
-           try !hasAssistantRecords(db, table: "session_message") {
-            message = "message"
+        let fields = ["role", "time", "tokens", "modelID", "providerID", "model", "path"]
+            .map { "'\($0)', json_extract(m.data, '$.\($0)')" }.joined(separator: ", ")
+        func read(_ messages: String, titles table: String?, where filter: String) throws {
+            let metadata = table == nil ? "NULL, NULL" : "s.title, s.directory"
+            let join = table.map { "LEFT JOIN \($0) s ON s.id = m.session_id" } ?? ""
+            var last: String?, count = 0
+            repeat {
+                count = 0
+                try db.rows("SELECT m.id, m.session_id, json_object(\(fields)), \(metadata) FROM \(messages) m \(join) WHERE \(filter) AND json_extract(m.data, '$.time.created') >= CAST(? AS REAL)\(last == nil ? "" : " AND m.id < ?") ORDER BY m.id DESC LIMIT \(openCodePage)",
+                            strings: [String(since.timeIntervalSince1970 * 1000)] + (last.map { [$0] } ?? [])) { row in
+                    guard let id = ReadOnlySQLite.text(row, 0), let sid = ReadOnlySQLite.text(row, 1), let raw = ReadOnlySQLite.text(row, 2) else { throw ProviderFailure.format }
+                    count += 1
+                    last = id
+                    if let item = try openCodeMessage(ProviderJSON.read(Data(raw.utf8)), id: id, sessionID: sid, path: url.path,
+                        title: ReadOnlySQLite.text(row, 3), workspace: ReadOnlySQLite.text(row, 4), assistant: messages == "session_message") {
+                        sessions.append(item)
+                    }
+                }
+            } while count == openCodePage
         }
-        guard tables.contains(message) else { throw ProviderFailure.format }
-        try db.requireTable(message)
-        let session = tables.contains("session_v2") ? "session_v2" : "session"
-        let hasSession = tables.contains(session)
-        if hasSession { try db.requireTable(session) }
-        let metadata = hasSession ? "s.title, s.directory" : "NULL, NULL"
-        let join = hasSession ? "LEFT JOIN \(session) s ON s.id = m.session_id" : ""
-        let filter = message == "session_message" ? "m.type = 'assistant'" : "json_extract(m.data, '$.role') = 'assistant'"
-        try db.rows("SELECT m.id, m.session_id, m.data, \(metadata) FROM \(message) m \(join) WHERE \(filter) AND json_extract(m.data, '$.time.created') >= CAST(? AS REAL) ORDER BY m.id DESC", strings: [String(since.timeIntervalSince1970 * 1000)]) { row in
-            guard let id = ReadOnlySQLite.text(row, 0), let sid = ReadOnlySQLite.text(row, 1), let raw = ReadOnlySQLite.text(row, 2) else { throw ProviderFailure.format }
-            if let item = try openCodeMessage(ProviderJSON.read(Data(raw.utf8)), id: id, sessionID: sid, path: url.path,
-                title: ReadOnlySQLite.text(row, 3), workspace: ReadOnlySQLite.text(row, 4), assistant: message == "session_message") {
-                sessions.append(item)
-            }
+        if newer {
+            try read("session_message", titles: ["session_v2", "session"].first(where: tables.contains), where: "m.type = 'assistant'")
+        }
+        if tables.contains("message") {
+            try read("message", titles: ["session", "session_v2"].first(where: tables.contains), where: "json_extract(m.data, '$.role') = 'assistant'"
+                + (newer ? " AND m.session_id NOT IN (SELECT session_id FROM session_message WHERE type = 'assistant' AND session_id IS NOT NULL)" : ""))
         }
         // OpenCode records the end of a turn itself; only the newest record of a session may speak for it.
-        for turn in try openCodeTurns(db, message: message, session: session, tables: tables, since: since) {
+        for turn in try openCodeTurns(db, tables: tables, since: since) {
             guard let index = sessions.firstIndex(where: { $0.id == turn.session }) else { continue }
             sessions[index].completions.append(SessionCompletion(
                 sessionID: turn.session, vendor: sessions[index].client.name, turnID: turn.id,
@@ -301,15 +332,18 @@ enum OpenAgentParser {
     /// flight stays silent, and a session an agent spawned never stands in for the conversation that spawned it. A
     /// message table that keeps platform events alone records no answer of its own, and one still streaming has no
     /// completion time.
-    static func openCodeTurns(_ db: ReadOnlySQLite, message: String, session: String, tables: Set<String>, since: Date)
+    static func openCodeTurns(_ db: ReadOnlySQLite, tables: Set<String>, since: Date)
         throws -> [(session: String, id: String, model: String?, startedAt: Date?, completedAt: Date)] {
         // Without parts an answer cannot be told from one that asked for a tool, and every turn would look complete.
-        guard message == "message", tables.contains("part") else { return [] }
+        guard tables.contains("message"), tables.contains("part") else { return [] }
         try db.requireTable("part")
         // Builds without subagents keep no parent column, and each session is then a conversation of its own.
         var spawned = ""
-        if tables.contains(session), try columns(db, table: session).contains("parent_id") {
-            spawned = " AND NOT EXISTS (SELECT 1 FROM \(session) s WHERE s.id = m.session_id AND s.parent_id IS NOT NULL)"
+        for name in ["session", "session_v2"] where tables.contains(name) {
+            if try columns(db, table: name).contains("parent_id") {
+                spawned = " AND NOT EXISTS (SELECT 1 FROM \(name) s WHERE s.id = m.session_id AND s.parent_id IS NOT NULL)"
+                break
+            }
         }
         var turns: [(session: String, id: String, model: String?, startedAt: Date?, completedAt: Date)] = []
         try db.rows("""

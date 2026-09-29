@@ -62,6 +62,30 @@ final class AdditionalProviderTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(AntigravityClient.ports("n127.0.0.1:42111\nn*:42111\nn[::1]:42112\n"), [42111, 42112])
     }
 
+    func testAWholeFileStoreLooksOnlyAtThePathsTheWatchReports() async throws {
+        let root = try directory()
+        func session(_ id: String) throws -> URL {
+            let folder = root.appendingPathComponent("%2Ffixture/\(id)")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let file = folder.appendingPathComponent("updates.jsonl")
+            try (#"{"method":"_x.ai/session/update","params":{"sessionId":"\#(id)","_meta":{"eventId":"done","agentTimestampMs":1788800002000},"update":{"sessionUpdate":"turn_completed","prompt_id":"p","stop_reason":"end_turn","usage":{"inputTokens":100,"outputTokens":20,"modelUsage":{"grok-test":{}}}}}}"#
+                + "\n").write(to: file, atomically: true, encoding: .utf8)
+            return file
+        }
+        _ = try session("a")
+        let store = AdditionalLocalStore(source: .grok, roots: [root])
+        var sessions = await store.index(since: .distantPast).sessions
+        XCTAssertEqual(sessions.count, 1)
+        // The collector's watch runs and saw nothing here.
+        await store.fileChanges([])
+        let added = try session("b")
+        sessions = await store.index(since: .distantPast).sessions
+        XCTAssertEqual(sessions.count, 1, "a read the watch did not ask for does not list the tree again")
+        await store.fileChanges([added.path])
+        sessions = await store.index(since: .distantPast).sessions
+        XCTAssertEqual(sessions.count, 2)
+    }
+
     func testGrokQuotaDistinguishesSubscriptionAndExtraBudget() throws {
         let quota = try GrokClient.parse(json(#"{"config":{"creditUsagePercent":12.5,"currentPeriod":{"start":"2026-09-01T00:00:00Z","end":"2026-09-08T00:00:00Z","type":"USAGE_PERIOD_TYPE_WEEKLY"},"onDemandCap":{"val":20},"onDemandUsed":{"val":3}}}"#))
         XCTAssertEqual(quota.windows.map(\.remaining), [87.5, 85])
@@ -157,6 +181,29 @@ final class AdditionalProviderTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(count, 1)
         XCTAssertNotNil(first.notice)
         XCTAssertEqual(first.notice, second.notice)
+    }
+
+    func testCursorUsageKeepsItsAccountThroughAFailedQuotaReading() async throws {
+        final class State: @unchecked Sendable { var reads = 0; var now = Date(timeIntervalSince1970: 1_788_800_000) }
+        let state = State(), ledger = UsageLedger.inMemory(), start = state.now
+        let account = ProviderAccount(provider: "Cursor", user: "user", workspace: "", evidence: .account)
+        let conversation = ProviderSession(id: "cursor-account:a:c", title: "Chat", client: "Cursor",
+            events: [ProviderEvent(id: "e", model: "cursor-test", timestamp: start.addingTimeInterval(-60), input: 10, output: 1)], accountWide: true)
+        let provider = AdditionalUsageProvider(source: .cursor, readQuota: {
+            state.reads += 1
+            guard state.reads == 1 else { throw ProviderHTTPError(status: 503) }
+            return ProviderQuota(windows: [.init(id: "cursor", label: "Plan usage", remaining: 60)], account: account)
+        }, readSessions: { _ in ProviderSessions(sessions: [conversation]) }, history: QuotaHistoryStore(), clock: { state.now }, ledger: ledger)
+        func accounts() async throws -> Set<String> {
+            Set(try await ledger.buckets(since: .distantPast, source: AdditionalSource.cursor.rawValue).compactMap(\.account))
+        }
+        _ = try await provider.fetchAccountAndLocalUsage(agents: [], historyHours: 168)
+        var recorded = try await accounts()
+        XCTAssertEqual(recorded, [account.id])
+        state.now = start.addingTimeInterval(UsageRefresh.accountRequestSpacing + 1)
+        _ = try await provider.fetchAccountAndLocalUsage(agents: [], historyHours: 168)
+        recorded = try await accounts()
+        XCTAssertEqual(recorded, [account.id], "a quota request that failed does not move the account's usage")
     }
 
     func testGrokUnifiedDeduplicatesAndDoesNotAddReasoningTwice() throws {

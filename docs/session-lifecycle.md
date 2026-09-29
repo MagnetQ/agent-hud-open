@@ -44,6 +44,7 @@ Which clients expose running and terminal turns, which of them say they are wait
 - A Claude Code session also runs while the sub-agents and workflow agents it started work, after its own agent ended its turn or went quiet waiting for them. Their logs sit in a directory named after the session's log (`<session>/subagents/`, workflow agents under `workflows/<run>/`), and their latest activity is the session's latest event.
 - Each of those logs follows its own turn: its prompt starts it; `end_turn`, a `StructuredOutput` call (a workflow agent handing back its result) or a `[Request interrupted` line ends it; 30 quiet minutes abandon it, as for any running turn. An agent stopped without any of these, such as one closed with its session, keeps the session running until then.
 - The session's turn keeps its id and start while its agents work. Sub-agent logs report no completions and mark no prompts, so the agent's own answer is still announced when it ends its turn.
+- A session waiting for approval keeps waiting while its agents work: a request is answered by a line of the session's own log after it, never by a sub-agent's.
 
 ### Pi observer
 
@@ -57,7 +58,7 @@ A transcript shows that a tool call is pending but not whether the client is run
 
 | Source | Configuration | Reported |
 | --- | --- | --- |
-| Claude Code | Group appended to `hooks.Notification` of `~/.claude/settings.json`; only commands ending in ` --attention-hook claude` are Agent HUD's | `session_id` and the client's `message`, at the callback time |
+| Claude Code | Group appended to `hooks.Notification` of `settings.json` in `$CLAUDE_CONFIG_DIR` (default `~/.claude`); only commands ending in ` --attention-hook claude` are Agent HUD's | `session_id` and the client's `message`, at the callback time |
 
 - The callback only says that the client needs the user; which kind of attention it is comes from the transcript, never from the wording of the message. A turn that is still running is waiting for approval and shows the message; a turn that already finished is waiting for the next prompt, which the transcript already said.
 - A request is answered as soon as the transcript carries a line newer than it. One unanswered request is kept per session, in `attention/<source>/<hashed session id>.json` in the data directory: session id, the client's message up to 2 KB, and the time. Requests are forgotten a day after they were made; a file's own timestamps are never used for that.
@@ -75,7 +76,7 @@ Antigravity, Cursor, GitHub Copilot CLI, CodeBuddy and Qwen Code do not record f
 | CodeBuddy | Group appended to `hooks.Stop` of `~/.codebuddy/settings.json`; only commands ending in ` --completion-hook codebuddy` are Agent HUD's | `hook_event_name` is `Stop` and `session_id` is present; the turn is the transcript's last completed assistant `messageId` after the last user message, else the callback time |
 | Qwen Code | Group appended to `hooks.Stop` of `settings.json` in `$QWEN_HOME` (default `~/.qwen`), timeout 5000 ms; only commands ending in ` --completion-hook qwen` are Agent HUD's | `hook_event_name` is `Stop` and `session_id` is present; the turn is `prompt_id` (0.23.4 and later), else the callback time. A cancelled or failed turn runs no `Stop` |
 
-- The handler command is `'<executable path>' --completion-hook <source>` with a 5-second timeout, written in the client's own unit. Other hooks in the file are preserved, and a file that already contains the identical configuration is not rewritten.
+- The handler command is `'<executable path>' --completion-hook <source>` with a 5-second timeout, written in the client's own unit. Other hooks in the file are preserved. A handler of Agent HUD's already in the file keeps its place and whatever a user changed in it — its group's matcher, its timeout, Antigravity's `enabled` — and only its command is set, so a file that needs no new command is not rewritten. A settings file kept as a symbolic link, as a dotfiles checkout keeps it, is written where the link leads and stays a link, and every rewritten file keeps its permissions; approval hooks are written the same way.
 - A handler whose installation is gone is replaced, or removed while Client hooks are off: its executable no longer exists, or lies under App Translocation or `/Volumes`, where an app runs when it is first opened from Downloads or from its disk image. Moving the application to its final place therefore moves its hooks at the next start.
 - A handler another installation still answers stays with it: automatic setup logs the conflict and leaves it, and so does switching Client hooks off. `--install-completion-hook <source>` takes it over explicitly ([command line](command-line.md#adapter-commands)); once that installation switches Client hooks off, this one adds its own at its next start.
 - An application running from under App Translocation or `/Volumes` installs no hook and logs why. Installing a hook never starts, restarts or interrupts the client and consumes no quota.
