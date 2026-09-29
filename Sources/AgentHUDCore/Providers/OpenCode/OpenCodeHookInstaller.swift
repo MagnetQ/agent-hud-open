@@ -29,7 +29,7 @@ public enum OpenCodeHookInstaller {
     static let pluginSource: String = #"""
     import type { Plugin } from "@opencode-ai/plugin"
 
-    const HUD_EXECUTABLE = "__HUD_PATH__"
+    const HUD_EXECUTABLE = __HUD_PATH__
     // Installed by Agent HUD Open — do not edit by hand.
 
     export default (async () => ({
@@ -59,13 +59,21 @@ public enum OpenCodeHookInstaller {
     })) satisfies Plugin
     """#
 
+    /// The path as a JavaScript string literal. `Bun.spawn` takes the command as an argument array and starts no shell,
+    /// so nothing is escaped for a shell's benefit: only the backslash and the double quote that would otherwise end or
+    /// continue the literal. Escaping a single quote instead would put one the command line never asked for.
+    private static func literal(_ path: String) -> String {
+        let escaped = path.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+
     public static func install(executable: URL, home: URL,
                                environment: [String: String] = ProcessInfo.processInfo.environment) throws {
         let directory = pluginDirectory(home: home, environment: environment)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o755])
-        let quoted = executable.path.replacingOccurrences(of: "'", with: "'\\''")
-        let body = pluginSource.replacingOccurrences(of: "__HUD_PATH__", with: quoted)
+        let body = pluginSource.replacingOccurrences(of: "__HUD_PATH__", with: literal(executable.path))
         let url = pluginURL(home: home, environment: environment)
         let existing = try? String(contentsOf: url, encoding: .utf8)
         guard existing != body else { return }

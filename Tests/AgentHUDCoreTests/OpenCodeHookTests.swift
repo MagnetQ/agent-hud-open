@@ -50,6 +50,21 @@ final class OpenCodeHookTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testThePathIsWrittenAsAJavaScriptLiteralAndNothingMore() throws {
+        let home = try directory()
+        // `Bun.spawn` starts no shell, so a single quote is an ordinary character there. Escaping it would hand the
+        // command line a quote the path never had.
+        for path in ["/Applications/It's Here.app/Contents/MacOS/Agent HUD Open",
+                     #"/Applications/The "Best" App/x"#,
+                     #"/Applications/back\slash.app/x"#] {
+            try OpenCodeHookInstaller.install(executable: URL(fileURLWithPath: path), home: home, environment: [:])
+            let body = try String(contentsOf: OpenCodeHookInstaller.pluginURL(home: home, environment: [:]), encoding: .utf8)
+            let assignment = try XCTUnwrap(body.split(separator: "\n").first { $0.contains("HUD_EXECUTABLE =") })
+            let expected = path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            XCTAssertEqual(assignment, "const HUD_EXECUTABLE = \"\(expected)\"", path)
+        }
+    }
+
     func testMovingTheApplicationMovesThePlugin() throws {
         let home = try directory(), other = try directory()
         try OpenCodeHookInstaller.install(executable: executable, home: home, environment: [:])
