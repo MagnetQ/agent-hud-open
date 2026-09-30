@@ -61,6 +61,8 @@ public enum OpenCodeHookInstaller {
 
     public static func install(executable: URL, home: URL,
                                environment: [String: String] = ProcessInfo.processInfo.environment) throws {
+        // The plugin names one executable, so a path that stops working when the app is moved must not be written.
+        try HookCommand.checkInstall(executable: executable)
         let directory = pluginDirectory(home: home, environment: environment)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o755])
