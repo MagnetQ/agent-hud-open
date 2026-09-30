@@ -14,6 +14,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
+        // Only one Agent HUD runs at a time, since the one that runs points the clients' hooks at itself: a launch while
+        // another copy runs says where it is and quits before reading or writing anything. A probe reads and quits, and
+        // a demo keeps its own preferences, has no ledger or report cache, installs no hooks and serves no approvals, so
+        // either may run beside the real one, unless it is told to reset the preferences, which that one uses.
+        if options.resetDefaults || (!options.probe && !options.demo), !SingleInstance.claim() {
+            NSApp.terminate(nil)
+            return
+        }
         let demoSuite = "app.agenthud.open.demo"
         if options.resetDefaults {
             // The demo keeps its own suite, so resetting has to clear that too or a stale demo survives it.
@@ -28,7 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         L10n.setLanguage(settings.settings.language)
         // A probe reads the way the application does and keeps nothing: its ledger lives in memory.
         let ledger: UsageLedger? = options.demo ? nil : options.probe ? .inMemory() : .open()
-        let provider: any UsageProvider = ledger.map { CombinedUsageProvider.standard(ledger: $0, persistent: !options.probe) } ?? DemoUsageProvider()
+        let provider: any UsageProvider = ledger.map { CombinedUsageProvider.standard(settings: settings, ledger: $0, persistent: !options.probe) } ?? DemoUsageProvider()
         if options.probe {
             Task { @MainActor in
                 do {
@@ -119,7 +127,7 @@ if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--install-comp
    let source = CompletionHooks.Source(rawValue: CommandLine.arguments[2]) {
     do {
         try CompletionHooks.configure(source, enabled: true,
-            executable: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL, replacingExisting: true)
+            executable: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL)
         print("Completion hook installed: \(source.rawValue)")
         exit(0)
     } catch {

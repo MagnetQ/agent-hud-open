@@ -275,7 +275,7 @@ public final class UsageStore {
                 agent: agent,
                 remainingPct: snapshot?.remainingPct,
                 level: isCurrent && report?.quotaNotice(for: agent) == nil ? snapshot.flatMap {
-                    ($0.resetAt ?? .distantFuture) > now && now.timeIntervalSince($0.updatedAt) < QuotaForecast.maximumReadingAge
+                    ($0.resetAt ?? .distantFuture) > now && now.timeIntervalSince($0.updatedAt) < AlertPolicy.maximumReadingAge
                         ? AlertPolicy.quotaLevel(remaining: $0.remainingPct) : nil
                 } : nil,
                 resetAt: snapshot?.resetAt,
@@ -298,16 +298,8 @@ public final class UsageStore {
     /// the phone: token history before the local ledger begins is not guessed at.
     public func quotaTokensPerHour(for agentId: String) -> Double? {
         guard let report, let snapshot = report.snapshot(for: agentId),
-              let consumers = report.consumerIdsByQuota[agentId], !consumers.isEmpty,
-              let cycle = snapshot.cycle, let oldest = report.usage.first?.start else { return nil }
-        let start = max(cycle.start, oldest)
-        let hours = now.timeIntervalSince(start) / 3600
-        guard hours > 0 else { return nil }
-        let tokens = report.usage.reduce(0) { total, bucket in
-            consumers.contains(bucket.agentId) && bucket.start >= start && bucket.start < now
-                ? total + bucket.total : total
-        }
-        return (Double(tokens) / hours).rounded()
+              let consumers = report.consumerIdsByQuota[agentId] else { return nil }
+        return QuotaMath.tokensPerHour(snapshot: snapshot, consumers: consumers, usage: report.usage, now: now)
     }
 
     /// Account cards shown in the island and menu follow the agent switches.
@@ -320,8 +312,7 @@ public final class UsageStore {
 
     public func balanceLevel(_ balance: AccountBalance, billing: APIBilling) -> StatusLevel? {
         guard !balance.total.isNaN else { return nil }
-        if billing.isAvailable == false { return .critical }
-        return AlertPolicy.balanceLevel(remaining: balance.total, currency: balance.currency)
+        return AlertPolicy.balanceLevel([balance], isAvailable: billing.isAvailable)
     }
 
     /// Status per enabled agent that has data, in glow order. Agents without a reading stay out of the glow.
@@ -331,13 +322,15 @@ public final class UsageStore {
         var seenAccounts: Set<String> = []
         return enabledAgents.flatMap { model -> [StatusLevel] in
             if !model.isAPIBilled { return quota[model.id].map { [$0] } ?? [] }
-            return accounts.filter { $0.contains(model) && seenAccounts.insert($0.id).inserted }.compactMap { billing in
-                if billing.isAvailable == false { return .critical }
-                let levels = billing.balances.compactMap { balanceLevel($0, billing: billing) }
-                return levels.contains(.critical) ? .critical : levels.contains(.warning) ? .warning : levels.first
+            return accounts.filter { $0.contains(model) && seenAccounts.insert($0.id).inserted }.compactMap {
+                AlertPolicy.balanceLevel($0.balances, isAvailable: $0.isAvailable)
             }
         }
     }
+
+    /// The vendor of each quota row that shows a status level, in row order. An alert's pulse lights the part of the glow
+    /// its vendor's entries take in this list.
+    public var alertPulseVendors: [String] { rows.filter { $0.level != nil }.map { $0.agent.vendor } }
 
     public var isIndexing: Bool { report?.indexing != nil }
 
@@ -618,5 +611,13 @@ public final class UsageStore {
             let rows = sections[key] ?? []
             return AccountSection(id: key, account: rows.first?.account, isCurrent: rows.first?.isCurrentAccount ?? true, rows: rows)
         }
+    }
+
+    /// What the header of an account's section says about its readings: the account's own notice, else its client's.
+    /// A billing pool speaks only for itself: its vendor's notices can be about another of its pools.
+    public func accountNotice(for section: AccountSection) -> String? {
+        guard let account = section.account else { return nil }
+        let pooled = section.rows.first?.agent.billingPool != nil
+        return account.quotaNotice ?? (pooled ? nil : report?.sourceNotices[account.account.provider])
     }
 }

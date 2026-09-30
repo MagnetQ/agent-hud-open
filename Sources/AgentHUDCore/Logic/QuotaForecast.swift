@@ -2,30 +2,27 @@ import Foundation
 
 /// Hover copy for a time-limited quota, using that window's existing burn-rate estimate.
 public enum QuotaForecast {
-    /// Old observations remain visible but must not generate new quota alerts.
-    public static let maximumReadingAge: TimeInterval = 30 * 60
+    /// `AlertPolicy.maximumReadingAge`.
+    public static var maximumReadingAge: TimeInterval { AlertPolicy.maximumReadingAge }
 
+    /// The text of the window's outlook. An exhaustion is given whether or not it comes before the reset.
     public static func hint(snapshot: UsageSnapshot, insights: UsageInsights?, now: Date) -> String? {
-        guard snapshot.resetAt != nil else { return nil }
-        if snapshot.remainingPct <= 0 {
-            return L10n.text("已耗尽", "Exhausted")
+        switch QuotaMath.outlook(snapshot: snapshot, insights: insights, now: now) {
+        case .untimed: return nil
+        case .exhausted: return L10n.text("已耗尽", "Exhausted")
+        case .noEstimate: return L10n.text("暂无预测", "No estimate")
+        case .noUsage: return L10n.text("暂无消耗", "No usage")
+        case .insufficientData: return L10n.text("记录不足", "Insufficient data")
+        case .exhausts(let interval, _):
+            // Keep the duration tied to the provider's latest estimate; don't simulate unobserved consumption.
+            let exhaustion = duration(interval)
+            return L10n.text("耗尽 ~\(exhaustion)", "Exhausts ~\(exhaustion)")
         }
-        guard snapshot.cycle != nil else {
-            return L10n.text("暂无预测", "No estimate")
-        }
-        if insights?.burnRatePctPerHour == 0 {
-            return L10n.text("暂无消耗", "No usage")
-        }
-        guard let interval = insights?.timeToExhaust, interval > 0, interval.isFinite else {
-            return L10n.text("记录不足", "Insufficient data")
-        }
-        // Keep the duration tied to the provider's latest estimate; don't simulate unobserved consumption.
-        let exhaustion = duration(interval)
-        return L10n.text("耗尽 ~\(exhaustion)", "Exhausts ~\(exhaustion)")
     }
 
     private static func duration(_ interval: TimeInterval) -> String {
-        let minutes = Int(ceil(interval / 60))
+        // A pace a hair above zero can put the end further off than a whole number of minutes holds.
+        let minutes = Int(min(ceil(interval / 60), Double(Int32.max)))
         let hours = minutes / 60
         if hours > 0 {
             if minutes % 60 == 0 { return L10n.text("\(hours)小时", "\(hours)h") }

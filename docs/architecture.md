@@ -23,7 +23,7 @@ Agent HUD Open is a Swift package with three libraries and one executable. `Agen
 - `fetchUsage(agents:historyHours:)` assembles local activity with the latest account results; `refreshAccountUsage(historyHours:)` performs the slower quota, balance and account-wide requests and has a no-op default; `accountRefreshSteps` splits it into steps the store runs between reads, and `watchedDirectories` names the directories whose changes need a read (nil means the provider is read every poll interval). A provider that wraps another forwards all of them.
 - `sources` splits a provider into parts read on their own, each with its signals: its directories, its account steps and the checks it asks for. A provider that does not split itself is one source. `fetchUsage(agents:historyHours:sources:)` reads the named sources again and keeps every other source's last result, and `sourceChecks()` names the times at which a source's last result changes with time alone. `accountChecks(since:now:)` names when each source's account steps are next worth running, and `seesLocalWork` is false for a provider whose usage is the account's from every device, which keeps it on the account interval. `CombinedUsageProvider` makes one source per vendor.
 - A provider that does not write the ledger reports its periods in `UsageReport.usage`; `CombinedUsageProvider` adds them to the ledger's totals.
-- Notices are reported by vendor in `UsageReport.sourceNotices`, and those about a quota or balance reading that failed or could not be verified also in `quotaNotices`, which alone hold back the vendor's alerts, levels and retained sessions; a report without `quotaNotices` counts every source notice.
+- Notices are reported by vendor in `UsageReport.sourceNotices`, and those about a quota or balance reading that failed or could not be verified also in `quotaNotices`, which alone hold back the vendor's alerts, levels and retained sessions; a report without `quotaNotices` counts every source notice. One account's failed or unverified reading is its `AccountObservation.quotaNotice` and holds back that account's rows; a billing pool's rows answer to their pool's notice alone, never to the vendor's, since each pool is read on its own.
 - A failed full refresh keeps the previous report and exposes `UsageStore.lastError`; a partial failure keeps the missing readings from the saved report.
 - `DesktopApplication` decides and presents island alerts itself: one `IslandEventTracker` checks every change of the report, the agent list or the Live status preference while the store is neither paused nor failing, and the island shows the new quota events, added usage resets and completed turns. Every host, the standalone application included, gets the same alerts without extra wiring.
 - A host that relays alerts elsewhere passes `onIslandEvents`. It receives every check after the island has presented it, including checks that found nothing, with the report and time the check used; the host maps that update and never runs a second tracker or presents again.
@@ -36,6 +36,7 @@ Agent HUD Open is a Swift package with three libraries and one executable. `Agen
 - Time-based changes of activity are checks, not polls: a session whose source never said what its turn is doing is read again when it reaches `UsageRefresh.liveThreshold` without an observation, and a running turn when it stops counting as current work and again at `UsageRefresh.abandonedTurnTimeout`, where silence means its client is gone.
 - File events name real paths; the collector compares them with each directory as given and as `realpath` resolves it.
 - A source's account steps run when its own work, or one of its windows resetting, makes a new reading worth taking; opening the panel, the menu or the statistics window reads every account, and no source repeats a request within `UsageRefresh.accountRequestSpacing`.
+- A settings change that needs a read wakes the collector at once, through `SettingsStore.onChange`, which a running `UsageStore` sets: a changed agent list reads every source, and GitHub Copilot quota reading switched on or off runs every account step. The pass it wakes is serial like any other. `CombinedUsageProvider.standard(settings:ledger:persistent:)` takes the same `SettingsStore`, and the Copilot provider asks it for the consent whenever a reading is due.
 - Every source is read again every `UsageRefresh.accountInterval`, which catches a file event the watch missed, and a refresh reads every source once.
 - `UsageStore.observeChanges(_:)` calls a handler with `UsageChanges` for every newly displayed report: usage totals, readings, the ids of changed sessions, turns, new completions and the inventory. Publishers subscribe instead of comparing reports.
 
@@ -47,10 +48,11 @@ Agent HUD Open is a Swift package with three libraries and one executable. `Agen
 - The merged report keeps the provider's discovered agents, accounts, active quota pools, completions and turns: the agent list and island events read them from `UsageStore.report`.
 - `UsageStore.remerge()` runs only `merge` again on the provider's last report, for data the host merges that changed since the pass. It never overlaps a local poll: a poll in progress merges for it, or merges again when its own merge had already started. A report installed with `replace(report:)` is not merged over.
 
-### Session observers and hook ownership
+### Session observers and hooks
 
-- `SessionObservers.configure(executable:enabled:)`, called after creating the store and before `start()` with `Settings.clientHooks`, installs the Pi observer when the Pi directory exists, the Antigravity, Cursor, GitHub Copilot CLI, CodeBuddy and Qwen Code stop hooks, Claude Code's notification hook and each detected client's approval hook when those clients are installed, or with `enabled` false removes this installation's handlers from them. Creating a `DesktopApplication` installs nothing; a change of `clientHooks` while it runs applies at once with the main bundle's executable.
-- A completion hook that points at another executable is preserved and the conflict is reported, unless that executable is gone or lies under App Translocation or `/Volumes`; `--install-completion-hook` transfers ownership explicitly ([completion hooks](session-lifecycle.md#completion-hooks)).
+- `SessionObservers.configure(executable:enabled:)`, called after creating the store and before `start()` with `Settings.clientHooks`, installs the Pi observer when the Pi directory exists, the Antigravity, Cursor, GitHub Copilot CLI, CodeBuddy and Qwen Code stop hooks, Claude Code's notification hook and each detected client's approval hook when those clients are installed, or with `enabled` false removes Agent HUD's handlers from them. Creating a `DesktopApplication` installs nothing; a change of `clientHooks` while it runs applies at once with the main bundle's executable.
+- Every Agent HUD handler belongs to the copy that runs, since only one runs at a time: `configure` points each one at the executable it is given, whichever copy wrote it, and adds none from under App Translocation or `/Volumes` ([completion hooks](session-lifecycle.md#completion-hooks)).
+- `HookSettings.write(_:to:)` writes every client settings file the hooks change, and a host's own hooks can use it too: through a symbolic link to the file it leads to, keeping the file's permissions.
 
 ### Storage
 
@@ -65,6 +67,7 @@ Agent HUD Open is a Swift package with three libraries and one executable. `Agen
 - Millisecond dates: persisted dates round-trip through milliseconds since 1970.
 - Tests need no credentials or network; the only probe that touches installed clients is opt-in.
 - Isolated sources: a missing, signed-out or failing client never hides another.
+- One copy at a time: every application built on these libraries shares `InstanceLock`, whatever its data directory or bundle identifier. A host calls `SingleInstance.claim()` at launch, after its probes and before it opens preferences, the ledger or a client's settings, and quits when it returns false.
 - No invented lifecycle: inactivity is never a completion, and a passed reset deadline is not a confirmed reset.
 - Observed rows only: rows, groups and first-launch entries come from what providers report or find on the Mac, never from a built-in list of placeholders.
 - Names apart from ids: vendor ids key settings, the ledger, accounts and sync records and never change; `VendorCatalog` holds the names shown, and a value it does not name is shown as written, never filed under another.
@@ -91,7 +94,10 @@ Agent HUD Open is a Swift package with three libraries and one executable. `Agen
 | `IslandEventTracker.Update` | AgentHUDCore | `completions` (new, Live status on, oldest first), `quotaAlerts` (warnings, exhaustion, resets), `exhaustedWindows` and `criticalWindows` (threshold crossings with the reading that crossed; reaching zero supersedes critical in the same reading), `resetCreditGrants` (accounts whose Codex reset-credit count rose, with the added credits when the provider lists them) |
 | `DesktopSettingsPage` | AgentHUDDesktop | `id`; `title` closure (follows language changes, also the page heading); `subtitle`; `symbol` and `color` for the sidebar icon; `preferredContentWidth` in points (built-in pages use 640); `@ViewBuilder` `content` |
 | Settings window | AgentHUDDesktop | 760 × 720 points, minimum 680 × 560, sidebar 212; the initial width grows to fit the widest host page |
+| `SingleInstance.claim(at:)` | AgentHUDDesktop | Takes the shared lock and keeps it for the process lifetime; false after an alert naming the copy that holds it. A lock that cannot be created returns true |
+| `InstanceLock.claim(at:executable:)` → `Claim` | AgentHUDCore | `acquired` (the lock lasts as long as the value), `held(by:)` (the application that runs, its bundle when it has one) or `unavailable`; `InstanceLock.sharedURL` is `~/Library/Caches/app.agenthud/instance.lock` |
 | `SessionObservers.configure(executable:)` | AgentHUDCore | Adapter setup with the executable that handles hook callbacks |
+| `HookSettings.write(_:to:)` | AgentHUDCore | Writes a client's settings object as sorted, pretty-printed JSON through its symbolic links, keeping the file's permissions |
 | `AgentHUDDataDirectory` | Host `Info.plist` | Name of the data directory under `~/Library/Application Support`; default `Agent HUD Open` |
 | Launch switches and probes | Standalone executable | [Command line](command-line.md) |
 
@@ -107,6 +113,7 @@ Agent HUD Open is a Swift package with three libraries and one executable. `Agen
 | Collection pipeline, signals and hooks; change sets | `Sources/AgentHUDCore/Store/UsageCollector.swift`, `FileChangeMonitor.swift`; `Sources/AgentHUDCore/Models/UsageChanges.swift` |
 | Stores and data directory | `Sources/AgentHUDCore/Store/UsageStore.swift`, `SettingsStore.swift`, `QuotaHistoryStore.swift`, `AppSupport.swift` |
 | Application object, launch options, host pages | `Sources/AgentHUDDesktop/App/DesktopApplication.swift`, `LaunchOptions.swift`, `Settings/DesktopSettingsPage.swift` |
+| One copy at a time | `Sources/AgentHUDCore/Store/InstanceLock.swift`, `Sources/AgentHUDDesktop/App/SingleInstance.swift` |
 | Island alerts: decision and presentation | `Sources/AgentHUDCore/Logic/IslandEvents.swift`, `QuotaAlerts.swift`; `Sources/AgentHUDDesktop/Notch/IslandController.swift`, `IslandAlert.swift` |
 | Standalone entry and commands | `Sources/AgentHUDOpenApp/main.swift` |
 | Build, boundary check, CI | `scripts/build-app.sh`, `scripts/check-source-boundaries.py`, `.github/workflows/ci.yml` |
